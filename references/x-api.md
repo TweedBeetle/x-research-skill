@@ -1,5 +1,7 @@
 # X API Reference
 
+**Official docs**: https://developer.x.com/en/docs/x-api
+
 ## Authentication
 
 Bearer token from env var `X_BEARER_TOKEN`.
@@ -22,7 +24,7 @@ GET https://api.x.com/2/tweets/search/all
 ```
 Searches the complete Post archive. Max 500 results per request. Available on **pay-per-use** (same credits as recent search) and Enterprise. Same query operators, same response format. 1,024-char query length (vs 512 for recent).
 
-**Note:** This skill currently only uses recent search. Full-archive is available on the same pay-per-use plan — no enterprise access required.
+**Note:** Use `--archive` flag to switch to full-archive search. Available on the same pay-per-use plan, no enterprise access required.
 
 ### Standard Query Params
 
@@ -164,3 +166,30 @@ GET https://api.x.com/2/tweets/{id}
 ```
 
 Same fields/expansions params. Use for fetching specific tweets by ID.
+
+## Engagement Endpoints
+
+All require OAuth 1.0a authentication and the authenticated user's ID (from `GET /2/users/me`).
+
+### Likes
+
+```
+POST   https://api.x.com/2/users/{user_id}/likes          body: {"tweet_id": "..."}
+DELETE https://api.x.com/2/users/{user_id}/likes/{tweet_id}
+```
+
+### Reposts (Retweets)
+
+```
+POST   https://api.x.com/2/users/{user_id}/retweets          body: {"tweet_id": "..."}
+DELETE https://api.x.com/2/users/{user_id}/retweets/{tweet_id}
+```
+
+### Follows
+
+```
+POST   https://api.x.com/2/users/{user_id}/following          body: {"target_user_id": "..."}
+DELETE https://api.x.com/2/users/{user_id}/following/{target_user_id}
+```
+
+Requires looking up the target user ID first via `GET /2/users/by/username/{username}`.

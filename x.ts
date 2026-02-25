@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /**
- * x-search — CLI for X/Twitter research.
+ * x — CLI for X/Twitter research, posting, and engagement.
  *
  * Commands:
- *   search <query> [options]    Search recent tweets
+ *   search <query> [options]    Search tweets (recent or full-archive)
  *   thread <tweet_id>           Fetch full conversation thread
  *   profile <username>          Recent tweets from a user
  *   tweet <tweet_id>            Fetch a single tweet
@@ -12,6 +12,17 @@
  *   watchlist remove <user>     Remove user from watchlist
  *   watchlist check             Check recent tweets from all watchlist accounts
  *   cache clear                 Clear search cache
+ *   post <text>                 Post a new tweet
+ *   reply <tweet_id> <text>     Reply to a tweet
+ *   quote <tweet_url> <text>    Quote tweet
+ *   delete <tweet_id>           Delete a tweet
+ *   thread-post --file <path>   Post a multi-tweet thread
+ *   like <tweet_id>             Like a tweet
+ *   unlike <tweet_id>           Unlike a tweet
+ *   repost <tweet_id>           Repost (retweet) a tweet
+ *   unrepost <tweet_id>         Undo a repost
+ *   follow <username>           Follow a user
+ *   unfollow <username>         Unfollow a user
  *
  * Search options:
  *   --sort likes|impressions|retweets|recent   Sort order (default: likes)
@@ -24,6 +35,7 @@
  *   --quick                    Quick mode: 1 page, noise filter, 1hr cache
  *   --from <username>          Shorthand for from:username in query
  *   --quality                  Pre-filter low-engagement (min_faves:10)
+ *   --archive                  Use full-archive search (all time, back to 2006)
  *   --save                     Save results to ~/clawd/drafts/
  *   --json                     Output raw JSON
  *   --markdown                 Output as markdown (for research docs)
@@ -85,6 +97,7 @@ async function cmdSearch() {
   // Parse new flags first (before getOpt consumes positional args)
   const quick = getFlag("quick");
   const quality = getFlag("quality");
+  const archive = getFlag("archive");
   const fromUser = getOpt("from");
 
   const sortOpt = getOpt("sort") || "likes";
@@ -110,7 +123,7 @@ async function cmdSearch() {
   let query = queryParts.join(" ");
 
   if (!query) {
-    console.error("Usage: x-search.ts search <query> [options]");
+    console.error("Usage: x.ts search <query> [options]");
     process.exit(1);
   }
 
@@ -145,6 +158,7 @@ async function cmdSearch() {
       pages,
       sortOrder: sortOpt === "recent" ? "recency" : "relevancy",
       since: since || undefined,
+      archive,
     });
     cache.set(query, cacheParams, tweets);
   }
@@ -220,7 +234,7 @@ async function cmdSearch() {
 async function cmdThread() {
   const tweetId = args[1];
   if (!tweetId) {
-    console.error("Usage: x-search.ts thread <tweet_id>");
+    console.error("Usage: x.ts thread <tweet_id>");
     process.exit(1);
   }
 
@@ -237,12 +251,16 @@ async function cmdThread() {
     console.log(fmt.formatTweetTelegram(t, undefined, { full: true }));
     console.log();
   }
+
+  // Cost: root tweet lookup ($0.005) + search pages ($0.005/tweet)
+  const cost = ((tweets.length) * 0.005 + 0.005).toFixed(2);
+  console.error(`\n📊 ${tweets.length} tweets read · est. cost ~$${cost}`);
 }
 
 async function cmdProfile() {
   const username = args[1]?.replace(/^@/, "");
   if (!username) {
-    console.error("Usage: x-search.ts profile <username>");
+    console.error("Usage: x.ts profile <username>");
     process.exit(1);
   }
 
@@ -260,12 +278,16 @@ async function cmdProfile() {
   } else {
     console.log(fmt.formatProfileTelegram(user, tweets));
   }
+
+  // Cost: 1 user lookup ($0.01) + tweet reads ($0.005 each)
+  const cost = (0.01 + tweets.length * 0.005).toFixed(2);
+  console.error(`\n📊 1 user + ${tweets.length} tweets read · est. cost ~$${cost}`);
 }
 
 async function cmdTweet() {
   const tweetId = args[1];
   if (!tweetId) {
-    console.error("Usage: x-search.ts tweet <tweet_id>");
+    console.error("Usage: x.ts tweet <tweet_id>");
     process.exit(1);
   }
 
@@ -281,6 +303,8 @@ async function cmdTweet() {
   } else {
     console.log(fmt.formatTweetTelegram(tweet, undefined, { full: true }));
   }
+
+  console.error(`\n📊 1 tweet read · est. cost ~$0.01`);
 }
 
 async function cmdWatchlist() {
@@ -291,7 +315,7 @@ async function cmdWatchlist() {
     const username = args[2]?.replace(/^@/, "");
     const note = args.slice(3).join(" ") || undefined;
     if (!username) {
-      console.error("Usage: x-search.ts watchlist add <username> [note]");
+      console.error("Usage: x.ts watchlist add <username> [note]");
       process.exit(1);
     }
     if (wl.accounts.find((a) => a.username.toLowerCase() === username.toLowerCase())) {
@@ -311,7 +335,7 @@ async function cmdWatchlist() {
   if (sub === "remove" || sub === "rm") {
     const username = args[2]?.replace(/^@/, "");
     if (!username) {
-      console.error("Usage: x-search.ts watchlist remove <username>");
+      console.error("Usage: x.ts watchlist remove <username>");
       process.exit(1);
     }
     const before = wl.accounts.length;
@@ -333,9 +357,11 @@ async function cmdWatchlist() {
       return;
     }
     console.log(`Checking ${wl.accounts.length} watchlist accounts...\n`);
+    let totalTweets = 0;
     for (const acct of wl.accounts) {
       try {
         const { user, tweets } = await api.profile(acct.username, { count: 5 });
+        totalTweets += tweets.length;
         const label = acct.note ? ` (${acct.note})` : "";
         console.log(`\n--- @${acct.username}${label} ---`);
         if (tweets.length === 0) {
@@ -350,6 +376,9 @@ async function cmdWatchlist() {
         console.error(`  Error checking @${acct.username}: ${e.message}`);
       }
     }
+    // Cost: 1 user lookup ($0.01) + tweets per account
+    const cost = (wl.accounts.length * 0.01 + totalTweets * 0.005).toFixed(2);
+    console.error(`\n📊 ${wl.accounts.length} accounts, ${totalTweets} tweets read · est. cost ~$${cost}`);
     return;
   }
 
@@ -365,6 +394,205 @@ async function cmdWatchlist() {
   }
 }
 
+async function cmdPost() {
+  const text = args.slice(1).join(" ");
+  if (!text) {
+    console.error("Usage: x.ts post <text>");
+    process.exit(1);
+  }
+  if (text.length > 25000) {
+    console.error(`Tweet is ${text.length} chars (max 25,000). Trim it.`);
+    process.exit(1);
+  }
+
+  const result = await api.createTweet(text);
+  console.log(`Posted: ${result.tweet_url}`);
+  console.error(`\n📊 1 tweet created · est. cost ~$0.01`);
+}
+
+async function cmdReply() {
+  const tweetId = args[1];
+  const text = args.slice(2).join(" ");
+  if (!tweetId || !text) {
+    console.error("Usage: x.ts reply <tweet_id_or_url> <text>");
+    process.exit(1);
+  }
+  if (text.length > 25000) {
+    console.error(`Reply is ${text.length} chars (max 25,000). Trim it.`);
+    process.exit(1);
+  }
+
+  // Extract tweet ID from URL if needed
+  const id = tweetId.match(/status\/(\d+)/)?.[1] || tweetId;
+  const result = await api.replyToTweet(text, id);
+  console.log(`Replied: ${result.tweet_url}`);
+  console.error(`\n📊 1 reply created · est. cost ~$0.01`);
+}
+
+async function cmdQuote() {
+  const tweetUrlOrId = args[1];
+  const text = args.slice(2).join(" ");
+  if (!tweetUrlOrId || !text) {
+    console.error("Usage: x.ts quote <tweet_url_or_id> <text>");
+    process.exit(1);
+  }
+  if (text.length > 25000) {
+    console.error(`Quote is ${text.length} chars (max 25,000). Trim it.`);
+    process.exit(1);
+  }
+
+  const result = await api.quoteTweet(text, tweetUrlOrId);
+  console.log(`Quoted: ${result.tweet_url}`);
+  console.error(`\n📊 1 quote tweet created · est. cost ~$0.01`);
+}
+
+async function cmdDelete() {
+  const tweetId = args[1];
+  if (!tweetId) {
+    console.error("Usage: x.ts delete <tweet_id>");
+    process.exit(1);
+  }
+
+  const id = tweetId.match(/status\/(\d+)/)?.[1] || tweetId;
+  const deleted = await api.deleteTweet(id);
+  if (deleted) {
+    console.log(`Deleted tweet ${id}`);
+  } else {
+    console.error(`Failed to delete tweet ${id}`);
+    process.exit(1);
+  }
+}
+
+async function cmdThreadPost() {
+  const filePath = getOpt("file");
+  let content: string;
+
+  if (filePath) {
+    if (!existsSync(filePath)) {
+      console.error(`File not found: ${filePath}`);
+      process.exit(1);
+    }
+    content = readFileSync(filePath, "utf-8");
+  } else {
+    // Read from stdin
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) {
+      chunks.push(chunk);
+    }
+    content = Buffer.concat(chunks).toString("utf-8");
+  }
+
+  if (!content.trim()) {
+    console.error("Usage: x.ts thread-post --file <path>");
+    console.error("  or pipe content: echo '...' | x.ts thread-post");
+    process.exit(1);
+  }
+
+  // Parse thread: split on ## Tweet N headers (matching draft format)
+  const tweetTexts: string[] = [];
+  const sections = content.split(/^## Tweet \d+.*$/m);
+  for (const section of sections) {
+    const trimmed = section.trim();
+    if (trimmed) tweetTexts.push(trimmed);
+  }
+
+  // Fallback: if no ## Tweet headers found, split on --- separator
+  if (tweetTexts.length <= 1 && content.includes("---")) {
+    tweetTexts.length = 0;
+    for (const section of content.split(/^---$/m)) {
+      const trimmed = section.trim();
+      if (trimmed) tweetTexts.push(trimmed);
+    }
+  }
+
+  // Final fallback: one tweet per non-empty line
+  if (tweetTexts.length <= 1 && !content.includes("## Tweet")) {
+    tweetTexts.length = 0;
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed) tweetTexts.push(trimmed);
+    }
+  }
+
+  if (tweetTexts.length === 0) {
+    console.error("No tweets found in input.");
+    process.exit(1);
+  }
+
+  console.error(`Posting thread (${tweetTexts.length} tweets)...`);
+
+  const results = await api.postThread(tweetTexts);
+  for (const r of results) {
+    console.log(`${r.tweet_url}`);
+  }
+  const cost = (results.length * 0.01).toFixed(2);
+  console.error(`\n📊 ${results.length} tweets posted · est. cost ~$${cost}`);
+}
+
+async function cmdLike() {
+  const tweetId = args[1];
+  if (!tweetId) {
+    console.error("Usage: x.ts like <tweet_id_or_url>");
+    process.exit(1);
+  }
+  const id = tweetId.match(/status\/(\d+)/)?.[1] || tweetId;
+  await api.likeTweet(id);
+  console.log(`Liked tweet ${id}`);
+}
+
+async function cmdUnlike() {
+  const tweetId = args[1];
+  if (!tweetId) {
+    console.error("Usage: x.ts unlike <tweet_id_or_url>");
+    process.exit(1);
+  }
+  const id = tweetId.match(/status\/(\d+)/)?.[1] || tweetId;
+  await api.unlikeTweet(id);
+  console.log(`Unliked tweet ${id}`);
+}
+
+async function cmdRepost() {
+  const tweetId = args[1];
+  if (!tweetId) {
+    console.error("Usage: x.ts repost <tweet_id_or_url>");
+    process.exit(1);
+  }
+  const id = tweetId.match(/status\/(\d+)/)?.[1] || tweetId;
+  await api.repostTweet(id);
+  console.log(`Reposted tweet ${id}`);
+}
+
+async function cmdUnrepost() {
+  const tweetId = args[1];
+  if (!tweetId) {
+    console.error("Usage: x.ts unrepost <tweet_id_or_url>");
+    process.exit(1);
+  }
+  const id = tweetId.match(/status\/(\d+)/)?.[1] || tweetId;
+  await api.unrepostTweet(id);
+  console.log(`Unreposted tweet ${id}`);
+}
+
+async function cmdFollow() {
+  const username = args[1]?.replace(/^@/, "");
+  if (!username) {
+    console.error("Usage: x.ts follow <username>");
+    process.exit(1);
+  }
+  await api.followUser(username);
+  console.log(`Followed @${username}`);
+}
+
+async function cmdUnfollow() {
+  const username = args[1]?.replace(/^@/, "");
+  if (!username) {
+    console.error("Usage: x.ts unfollow <username>");
+    process.exit(1);
+  }
+  await api.unfollowUser(username);
+  console.log(`Unfollowed @${username}`);
+}
+
 async function cmdCache() {
   const sub = args[1];
   if (sub === "clear") {
@@ -377,13 +605,24 @@ async function cmdCache() {
 }
 
 function usage() {
-  console.log(`x-search — X/Twitter research CLI
+  console.log(`x — X/Twitter research, posting & engagement CLI
 
 Commands:
-  search <query> [options]    Search recent tweets (last 7 days)
+  search <query> [options]    Search tweets (recent or full-archive)
   thread <tweet_id>           Fetch full conversation thread
   profile <username>          Recent tweets from a user
   tweet <tweet_id>            Fetch a single tweet
+  post <text>                 Post a new tweet
+  reply <tweet_id> <text>     Reply to a tweet
+  quote <tweet_url> <text>    Quote tweet
+  delete <tweet_id>           Delete a tweet
+  thread-post --file <path>   Post a multi-tweet thread
+  like <tweet_id>             Like a tweet
+  unlike <tweet_id>           Unlike a tweet
+  repost <tweet_id>           Repost (retweet) a tweet
+  unrepost <tweet_id>         Undo a repost
+  follow <username>           Follow a user
+  unfollow <username>         Unfollow a user
   watchlist                   Show watchlist
   watchlist add <user> [note] Add user to watchlist
   watchlist remove <user>     Remove user from watchlist
@@ -401,10 +640,14 @@ Search options:
                              filter, 1hr cache TTL, cost summary
   --from <username>          Shorthand for from:username in query
   --quality                  Pre-filter low-engagement tweets (min_faves:10)
+  --archive                  Full-archive search (all time, back to 2006)
   --no-replies               Exclude replies
   --save                     Save to ~/clawd/drafts/
   --json                     Raw JSON output
-  --markdown                 Markdown output`);
+  --markdown                 Markdown output
+
+Write/engagement commands require OAuth 1.0a creds in ~/keys/:
+  X_API_KEY.txt, X_API_SECRET.txt, X_ACCESS_TOKEN.txt, X_ACCESS_TOKEN_SECRET.txt`);
 }
 
 // --- Main ---
@@ -425,6 +668,44 @@ async function main() {
       break;
     case "tweet":
       await cmdTweet();
+      break;
+    case "post":
+      await cmdPost();
+      break;
+    case "reply":
+      await cmdReply();
+      break;
+    case "quote":
+    case "qt":
+      await cmdQuote();
+      break;
+    case "delete":
+    case "del":
+      await cmdDelete();
+      break;
+    case "thread-post":
+    case "tp":
+      await cmdThreadPost();
+      break;
+    case "like":
+      await cmdLike();
+      break;
+    case "unlike":
+      await cmdUnlike();
+      break;
+    case "repost":
+    case "rt":
+      await cmdRepost();
+      break;
+    case "unrepost":
+    case "unrt":
+      await cmdUnrepost();
+      break;
+    case "follow":
+      await cmdFollow();
+      break;
+    case "unfollow":
+      await cmdUnfollow();
       break;
     case "watchlist":
     case "wl":

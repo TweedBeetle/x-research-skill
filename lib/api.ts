@@ -1,30 +1,112 @@
 /**
- * X API wrapper — search, threads, profiles, single tweets.
- * Uses Bearer token from env: X_BEARER_TOKEN
+ * X API wrapper — search, threads, profiles, single tweets, posting, engagement.
+ * Read operations use Bearer token: X_BEARER_TOKEN
+ * Write operations use OAuth 1.0a: X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET
  */
 
 import { readFileSync } from "fs";
+import { createHmac, randomBytes } from "crypto";
 
 const BASE = "https://api.x.com/2";
 const RATE_DELAY_MS = 350; // stay under 450 req/15min
 
-function getToken(): string {
-  // Try env first
-  if (process.env.X_BEARER_TOKEN) return process.env.X_BEARER_TOKEN;
-
-  // Try global.env
+function readEnvFile(): Record<string, string> {
+  const vars: Record<string, string> = {};
+  // Try ~/keys/ directory (each file is KEY_NAME.txt containing the value)
   try {
-    const envFile = readFileSync(
-      `${process.env.HOME}/.config/env/global.env`,
-      "utf-8"
-    );
-    const match = envFile.match(/X_BEARER_TOKEN=["']?([^"'\n]+)/);
-    if (match) return match[1];
+    const keysDir = `${process.env.HOME}/keys`;
+    const { readdirSync } = require("fs");
+    for (const file of readdirSync(keysDir)) {
+      if (file.endsWith(".txt")) {
+        const key = file.replace(".txt", "");
+        vars[key] = readFileSync(`${keysDir}/${file}`, "utf-8").trim();
+      }
+    }
   } catch {}
+  return vars;
+}
 
-  throw new Error(
-    "X_BEARER_TOKEN not found in env or ~/.config/env/global.env"
+const envCache = readEnvFile();
+
+function getEnv(key: string): string | undefined {
+  return process.env[key] || envCache[key];
+}
+
+function getToken(): string {
+  const token = getEnv("X_BEARER_TOKEN");
+  if (token) return token;
+  throw new Error("X_BEARER_TOKEN not found in env or ~/keys/");
+}
+
+interface OAuthCreds {
+  apiKey: string;
+  apiSecret: string;
+  accessToken: string;
+  accessTokenSecret: string;
+}
+
+function getOAuthCreds(): OAuthCreds {
+  const apiKey = getEnv("X_API_KEY");
+  const apiSecret = getEnv("X_API_SECRET");
+  const accessToken = getEnv("X_ACCESS_TOKEN");
+  const accessTokenSecret = getEnv("X_ACCESS_TOKEN_SECRET");
+
+  if (!apiKey || !apiSecret || !accessToken || !accessTokenSecret) {
+    const missing = [
+      !apiKey && "X_API_KEY",
+      !apiSecret && "X_API_SECRET",
+      !accessToken && "X_ACCESS_TOKEN",
+      !accessTokenSecret && "X_ACCESS_TOKEN_SECRET",
+    ].filter(Boolean);
+    throw new Error(
+      `OAuth 1.0a credentials missing: ${missing.join(", ")}. ` +
+      `Store in ~/keys/ as .txt files or set as env vars. ` +
+      `Generate at https://developer.x.com/en/portal/projects-and-apps`
+    );
+  }
+
+  return { apiKey, apiSecret, accessToken, accessTokenSecret };
+}
+
+function encodeRFC3986(str: string): string {
+  return encodeURIComponent(str).replace(
+    /[!'()*]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`
   );
+}
+
+function buildOAuthHeader(
+  method: string,
+  url: string,
+  creds: OAuthCreds
+): string {
+  const oauthParams: Record<string, string> = {
+    oauth_consumer_key: creds.apiKey,
+    oauth_nonce: randomBytes(16).toString("hex"),
+    oauth_signature_method: "HMAC-SHA1",
+    oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
+    oauth_token: creds.accessToken,
+    oauth_version: "1.0",
+  };
+
+  // Signature base string: sorted params
+  const sortedParams = Object.keys(oauthParams)
+    .sort()
+    .map((k) => `${encodeRFC3986(k)}=${encodeRFC3986(oauthParams[k])}`)
+    .join("&");
+  const baseString = `${method}&${encodeRFC3986(url)}&${encodeRFC3986(sortedParams)}`;
+  const signingKey = `${encodeRFC3986(creds.apiSecret)}&${encodeRFC3986(creds.accessTokenSecret)}`;
+  const signature = createHmac("sha1", signingKey)
+    .update(baseString)
+    .digest("base64");
+
+  oauthParams.oauth_signature = signature;
+
+  const header = Object.keys(oauthParams)
+    .sort()
+    .map((k) => `${encodeRFC3986(k)}="${encodeRFC3986(oauthParams[k])}"`)
+    .join(", ");
+  return `OAuth ${header}`;
 }
 
 async function sleep(ms: number) {
@@ -160,9 +242,9 @@ async function apiGet(url: string): Promise<RawResponse> {
 }
 
 /**
- * Search recent tweets (last 7 days).
- * Note: Full-archive search (/2/tweets/search/all) is available on the same
- * pay-per-use plan (no enterprise required) but not yet implemented here.
+ * Search tweets. Uses recent search (last 7 days) by default.
+ * Pass archive: true for full-archive search (all time, back to March 2006).
+ * Full-archive uses /2/tweets/search/all (same pay-per-use credits, max 500 results/page).
  */
 export async function search(
   query: string,
@@ -171,9 +253,12 @@ export async function search(
     pages?: number;
     sortOrder?: "relevancy" | "recency";
     since?: string; // ISO 8601 timestamp or shorthand like "1h", "3h", "1d"
+    archive?: boolean;
   } = {}
 ): Promise<Tweet[]> {
-  const maxResults = Math.max(Math.min(opts.maxResults || 100, 100), 10);
+  const endpoint = opts.archive ? "tweets/search/all" : "tweets/search/recent";
+  const maxPerPage = opts.archive ? 500 : 100;
+  const maxResults = Math.max(Math.min(opts.maxResults || maxPerPage, maxPerPage), 10);
   const pages = opts.pages || 1;
   const sort = opts.sortOrder || "relevancy";
   const encoded = encodeURIComponent(query);
@@ -194,7 +279,7 @@ export async function search(
     const pagination = nextToken
       ? `&pagination_token=${nextToken}`
       : "";
-    const url = `${BASE}/tweets/search/recent?query=${encoded}&max_results=${maxResults}&${FIELDS}&sort_order=${sort}${timeFilter}${pagination}`;
+    const url = `${BASE}/${endpoint}?query=${encoded}&max_results=${maxResults}&${FIELDS}&sort_order=${sort}${timeFilter}${pagination}`;
 
     const raw = await apiGet(url);
     const tweets = parseTweets(raw);
@@ -319,4 +404,245 @@ export function dedupe(tweets: Tweet[]): Tweet[] {
     seen.add(t.id);
     return true;
   });
+}
+
+// --- Write operations (OAuth 1.0a) ---
+
+export interface PostResult {
+  id: string;
+  text: string;
+  tweet_url: string;
+}
+
+async function apiPostOAuth(
+  url: string,
+  body: Record<string, any>
+): Promise<any> {
+  const creds = getOAuthCreds();
+  const authHeader = buildOAuthHeader("POST", url, creds);
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: authHeader,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`X API ${res.status}: ${text.slice(0, 300)}`);
+  }
+
+  return res.json();
+}
+
+async function apiDeleteOAuth(url: string): Promise<any> {
+  const creds = getOAuthCreds();
+  const authHeader = buildOAuthHeader("DELETE", url, creds);
+
+  const res = await fetch(url, {
+    method: "DELETE",
+    headers: { Authorization: authHeader },
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`X API ${res.status}: ${text.slice(0, 300)}`);
+  }
+
+  return res.json();
+}
+
+/**
+ * Post a new tweet.
+ */
+export async function createTweet(text: string): Promise<PostResult> {
+  const url = `${BASE}/tweets`;
+  const result = await apiPostOAuth(url, { text });
+  const id = result.data?.id;
+  // Get username for URL (need to look up authenticated user)
+  const username = await getAuthenticatedUsername();
+  return {
+    id,
+    text: result.data?.text || text,
+    tweet_url: `https://x.com/${username}/status/${id}`,
+  };
+}
+
+/**
+ * Reply to an existing tweet.
+ */
+export async function replyToTweet(
+  text: string,
+  inReplyToId: string
+): Promise<PostResult> {
+  const url = `${BASE}/tweets`;
+  const result = await apiPostOAuth(url, {
+    text,
+    reply: { in_reply_to_tweet_id: inReplyToId },
+  });
+  const id = result.data?.id;
+  const username = await getAuthenticatedUsername();
+  return {
+    id,
+    text: result.data?.text || text,
+    tweet_url: `https://x.com/${username}/status/${id}`,
+  };
+}
+
+/**
+ * Quote tweet (retweet with comment).
+ */
+export async function quoteTweet(
+  text: string,
+  quotedTweetUrl: string
+): Promise<PostResult> {
+  const url = `${BASE}/tweets`;
+  const result = await apiPostOAuth(url, {
+    text,
+    quote_tweet_id: extractTweetId(quotedTweetUrl),
+  });
+  const id = result.data?.id;
+  const username = await getAuthenticatedUsername();
+  return {
+    id,
+    text: result.data?.text || text,
+    tweet_url: `https://x.com/${username}/status/${id}`,
+  };
+}
+
+/**
+ * Delete a tweet.
+ */
+export async function deleteTweet(tweetId: string): Promise<boolean> {
+  const url = `${BASE}/tweets/${tweetId}`;
+  const result = await apiDeleteOAuth(url);
+  return result.data?.deleted === true;
+}
+
+function extractTweetId(urlOrId: string): string {
+  const match = urlOrId.match(/status\/(\d+)/);
+  return match ? match[1] : urlOrId;
+}
+
+let _cachedUsername: string | null = null;
+let _cachedUserId: string | null = null;
+
+async function apiGetOAuth(url: string): Promise<any> {
+  const creds = getOAuthCreds();
+  const authHeader = buildOAuthHeader("GET", url, creds);
+  const res = await fetch(url, {
+    headers: { Authorization: authHeader },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`X API ${res.status}: ${text.slice(0, 300)}`);
+  }
+  return res.json();
+}
+
+async function getAuthenticatedUsername(): Promise<string> {
+  if (_cachedUsername) return _cachedUsername;
+  const data = await apiGetOAuth(`${BASE}/users/me`).catch(() => null);
+  if (!data) return "me";
+  _cachedUsername = data.data?.username || "me";
+  _cachedUserId = data.data?.id || null;
+  return _cachedUsername;
+}
+
+async function getAuthenticatedUserId(): Promise<string> {
+  if (_cachedUserId) return _cachedUserId;
+  const data = await apiGetOAuth(`${BASE}/users/me`);
+  _cachedUserId = data.data?.id;
+  _cachedUsername = data.data?.username || _cachedUsername;
+  if (!_cachedUserId) throw new Error("Could not retrieve authenticated user ID");
+  return _cachedUserId;
+}
+
+// --- Thread posting ---
+
+/**
+ * Post a multi-tweet thread. First tweet is posted normally,
+ * subsequent tweets are chained as replies.
+ */
+export async function postThread(tweets: string[]): Promise<PostResult[]> {
+  if (tweets.length === 0) throw new Error("No tweets to post");
+
+  const results: PostResult[] = [];
+  const first = await createTweet(tweets[0]);
+  results.push(first);
+
+  for (let i = 1; i < tweets.length; i++) {
+    await sleep(1000); // delay between posts to avoid rate issues
+    const reply = await replyToTweet(tweets[i], results[i - 1].id);
+    results.push(reply);
+  }
+
+  return results;
+}
+
+// --- Engagement operations ---
+
+/**
+ * Like a tweet.
+ */
+export async function likeTweet(tweetId: string): Promise<void> {
+  const userId = await getAuthenticatedUserId();
+  const url = `${BASE}/users/${userId}/likes`;
+  await apiPostOAuth(url, { tweet_id: tweetId });
+}
+
+/**
+ * Unlike a tweet.
+ */
+export async function unlikeTweet(tweetId: string): Promise<void> {
+  const userId = await getAuthenticatedUserId();
+  const url = `${BASE}/users/${userId}/likes/${tweetId}`;
+  await apiDeleteOAuth(url);
+}
+
+/**
+ * Repost (retweet) a tweet.
+ */
+export async function repostTweet(tweetId: string): Promise<void> {
+  const userId = await getAuthenticatedUserId();
+  const url = `${BASE}/users/${userId}/retweets`;
+  await apiPostOAuth(url, { tweet_id: tweetId });
+}
+
+/**
+ * Undo a repost.
+ */
+export async function unrepostTweet(tweetId: string): Promise<void> {
+  const userId = await getAuthenticatedUserId();
+  const url = `${BASE}/users/${userId}/retweets/${tweetId}`;
+  await apiDeleteOAuth(url);
+}
+
+/**
+ * Follow a user by username.
+ */
+export async function followUser(username: string): Promise<void> {
+  const userId = await getAuthenticatedUserId();
+  // Look up target user ID
+  const targetData = await apiGetOAuth(`${BASE}/users/by/username/${username}`);
+  const targetId = targetData.data?.id;
+  if (!targetId) throw new Error(`User @${username} not found`);
+  const url = `${BASE}/users/${userId}/following`;
+  await apiPostOAuth(url, { target_user_id: targetId });
+}
+
+/**
+ * Unfollow a user by username.
+ */
+export async function unfollowUser(username: string): Promise<void> {
+  const userId = await getAuthenticatedUserId();
+  // Look up target user ID
+  const targetData = await apiGetOAuth(`${BASE}/users/by/username/${username}`);
+  const targetId = targetData.data?.id;
+  if (!targetId) throw new Error(`User @${username} not found`);
+  const url = `${BASE}/users/${userId}/following/${targetId}`;
+  await apiDeleteOAuth(url);
 }

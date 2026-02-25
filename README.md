@@ -56,23 +56,23 @@ git clone https://github.com/rohunvora/x-research-skill.git x-research
 cd skills/x-research
 
 # Search (sorted by likes, auto-filters retweets)
-bun run x-search.ts search "your query" --sort likes --limit 10
+bun run x.ts search "your query" --sort likes --limit 10
 
 # Profile — recent tweets from a user
-bun run x-search.ts profile username
+bun run x.ts profile username
 
 # Thread — full conversation
-bun run x-search.ts thread TWEET_ID
+bun run x.ts thread TWEET_ID
 
 # Single tweet
-bun run x-search.ts tweet TWEET_ID
+bun run x.ts tweet TWEET_ID
 
 # Watchlist
-bun run x-search.ts watchlist add username "optional note"
-bun run x-search.ts watchlist check
+bun run x.ts watchlist add username "optional note"
+bun run x.ts watchlist check
 
 # Save research to file
-bun run x-search.ts search "query" --save --markdown
+bun run x.ts search "query" --save --markdown
 ```
 
 ### Search options
@@ -105,13 +105,13 @@ bun run x-search.ts search "query" --save --markdown
 **Examples:**
 ```bash
 # Quick pulse check on a topic
-bun run x-search.ts search "BNKR" --quick
+bun run x.ts search "BNKR" --quick
 
 # Quick check what someone is saying
-bun run x-search.ts search "BNKR" --from voidcider --quick
+bun run x.ts search "BNKR" --from voidcider --quick
 
 # Quick quality-only results
-bun run x-search.ts search "AI agents" --quality --quick
+bun run x.ts search "AI agents" --quality --quick
 ```
 
 **Why it's cheaper:**
@@ -126,11 +126,11 @@ Adds `from:username` to your query without having to type the full operator synt
 
 ```bash
 # These are equivalent:
-bun run x-search.ts search "BNKR from:voidcider"
-bun run x-search.ts search "BNKR" --from voidcider
+bun run x.ts search "BNKR from:voidcider"
+bun run x.ts search "BNKR" --from voidcider
 
 # Works with --quick and other flags
-bun run x-search.ts search "AI" --from frankdegods --quick --quality
+bun run x.ts search "AI" --from frankdegods --quick --quality
 ```
 
 If your query already contains `from:`, the flag won't double-add it.
@@ -140,7 +140,7 @@ If your query already contains `from:`, the flag won't double-add it.
 Filters out low-engagement tweets (≥10 likes required). Applied post-fetch since `min_faves` isn't available as an X API search operator.
 
 ```bash
-bun run x-search.ts search "crypto AI" --quality
+bun run x.ts search "crypto AI" --quality
 ```
 
 ## Cost
@@ -184,7 +184,7 @@ As of February 2026, the X API uses **pay-per-use pricing** with prepaid credits
 ```
 x-research/
 ├── SKILL.md              # Agent instructions (Claude reads this)
-├── x-search.ts           # CLI entry point
+├── x.ts                  # CLI entry point
 ├── lib/
 │   ├── api.ts            # X API wrapper
 │   ├── cache.ts          # File-based cache
@@ -207,11 +207,9 @@ x-research/
 
 ## Limitations
 
-- Search covers last 7 days only (uses `/2/tweets/search/recent` — the full-archive `/2/tweets/search/all` endpoint is available on the same pay-per-use plan but not yet implemented in this skill)
-- Read-only — never posts or interacts
+- Search defaults to last 7 days (use `--archive` for full-archive back to March 2006)
 - Requires X API access with prepaid credits ([sign up](https://console.x.com))
 - `min_likes` / `min_retweets` search operators unavailable (filtered post-hoc instead)
-- Full-archive search (beyond 7 days) is available on pay-per-use (same credits). See [X API search docs](https://docs.x.com/x-api/posts/search/introduction). This skill currently only uses recent search — full-archive support coming soon.
 
 ## Star History
 
