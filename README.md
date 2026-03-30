@@ -7,10 +7,13 @@ X/Twitter research agent for [Claude Code](https://code.claude.com) and [OpenCla
 Wraps the X API into a fast CLI so your AI agent (or you) can search tweets, pull threads, monitor accounts, and get sourced research without writing curl commands.
 
 - **Search** with engagement sorting, time filtering, noise removal
+- **Post with images** -- attach photos to tweets, replies, and quotes
+- **Bookmarks** -- list, add, and remove bookmarks
+- **Direct messages** -- send DMs, list conversations
 - **Quick mode** for cheap, targeted lookups
 - **Watchlists** for monitoring accounts
 - **Cache** to avoid repeat API charges
-- **Cost transparency** — every search shows what it cost
+- **Cost transparency** -- every command shows what it cost
 
 ## Install
 
@@ -37,10 +40,7 @@ git clone https://github.com/rohunvora/x-research-skill.git x-research
    ```bash
    export X_BEARER_TOKEN="your-token-here"
    ```
-   Or save it to `~/.config/env/global.env`:
-   ```
-   X_BEARER_TOKEN=your-token-here
-   ```
+   Or save it to `~/keys/X_BEARER_TOKEN.txt` (auto-loaded by the skill).
 3. **Install Bun** (for CLI tooling): https://bun.sh
 
 ## Usage
@@ -67,6 +67,21 @@ bun run x.ts thread TWEET_ID
 # Single tweet
 bun run x.ts tweet TWEET_ID
 
+# Post with image
+bun run x.ts post "Tweet with a photo" --media /path/to/image.jpg
+
+# Upload media (prints media_id)
+bun run x.ts upload /path/to/image.png
+
+# Bookmarks
+bun run x.ts bookmarks
+bun run x.ts bookmark TWEET_ID
+bun run x.ts unbookmark TWEET_ID
+
+# Direct messages
+bun run x.ts dm username "Hello!"
+bun run x.ts dms --limit 10
+
 # Watchlist
 bun run x.ts watchlist add username "optional note"
 bun run x.ts watchlist check
@@ -87,7 +102,7 @@ bun run x.ts search "query" --save --markdown
 --from <username>          Shorthand for from:username in query
 --quality                  Pre-filter low-engagement tweets (min_faves:10)
 --no-replies               Exclude replies
---save                     Save to ~/clawd/drafts/
+--save                     Save to ~/.claude/drafts/
 --json                     Raw JSON output
 --markdown                 Markdown research doc
 ```
@@ -196,14 +211,13 @@ x-research/
 
 ## Security
 
-**Bearer token handling:** x-search reads your token from the `X_BEARER_TOKEN` env var or `~/.config/env/global.env`. The token is never printed to stdout, but be aware:
+**OAuth credential handling:** x-search uses OAuth 1.0a for all operations (read and write). Credentials are loaded from `~/keys/X_*.txt` files. They are never printed to stdout, but be aware:
 
-- **AI coding agents** (Claude Code, Codex, etc.) may log tool calls — including HTTP headers — in session transcripts. If you're running x-search inside an agent session, your bearer token could appear in those logs.
+- **AI coding agents** (Claude Code, Codex, etc.) may log tool calls — including HTTP headers — in session transcripts. If you're running x-search inside an agent session, your OAuth credentials could appear in those logs.
 - **Recommendations:**
-  - Set `X_BEARER_TOKEN` as a system env var (not inline in commands)
+  - Store credentials in `~/keys/` files (not inline in commands)
   - Review your agent's session log settings
-  - Use a token with minimal permissions (read-only)
-  - Rotate your token if you suspect exposure
+  - Rotate credentials if you suspect exposure
 
 ## Limitations
 

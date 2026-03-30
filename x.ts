@@ -23,6 +23,13 @@
  *   unrepost <tweet_id>         Undo a repost
  *   follow <username>           Follow a user
  *   unfollow <username>         Unfollow a user
+ *   upload <filepath>           Upload media, print media_id
+ *   bookmarks [--limit N]       List bookmarks (alias: bm)
+ *   bookmark <tweet_id>         Bookmark a tweet
+ *   unbookmark <tweet_id>       Remove a bookmark
+ *   dm <username> <text>        Send a direct message
+ *   dms [--limit N]             List recent DM events
+ *   dms <conversation_id>       List events in a conversation
  *
  * Search options:
  *   --sort likes|impressions|retweets|recent   Sort order (default: likes)
@@ -36,7 +43,7 @@
  *   --from <username>          Shorthand for from:username in query
  *   --quality                  Pre-filter low-engagement (min_faves:10)
  *   --archive                  Use full-archive search (all time, back to 2006)
- *   --save                     Save results to ~/clawd/drafts/
+ *   --save                     Save results to ~/.claude/drafts/
  *   --json                     Output raw JSON
  *   --markdown                 Output as markdown (for research docs)
  */
@@ -49,7 +56,7 @@ import * as fmt from "./lib/format";
 
 const SKILL_DIR = import.meta.dir;
 const WATCHLIST_PATH = join(SKILL_DIR, "data", "watchlist.json");
-const DRAFTS_DIR = join(process.env.HOME!, "clawd", "drafts");
+const DRAFTS_DIR = join(process.env.HOME!, ".claude", "drafts");
 
 // --- Arg parsing ---
 
@@ -395,9 +402,10 @@ async function cmdWatchlist() {
 }
 
 async function cmdPost() {
+  const mediaPath = getOpt("media");
   const text = args.slice(1).join(" ");
   if (!text) {
-    console.error("Usage: x.ts post <text>");
+    console.error("Usage: x.ts post <text> [--media <filepath>]");
     process.exit(1);
   }
   if (text.length > 25000) {
@@ -405,16 +413,26 @@ async function cmdPost() {
     process.exit(1);
   }
 
-  const result = await api.createTweet(text);
+  let mediaIds: string[] | undefined;
+  if (mediaPath) {
+    console.error(`Uploading ${mediaPath}...`);
+    const upload = await api.uploadMedia(mediaPath);
+    mediaIds = [upload.media_id_string];
+    console.error(`Uploaded: ${upload.media_id_string} (${(upload.size / 1024).toFixed(0)}KB ${upload.media_type})`);
+  }
+
+  const result = await api.createTweet(text, { mediaIds });
   console.log(`Posted: ${result.tweet_url}`);
-  console.error(`\n📊 1 tweet created · est. cost ~$0.01`);
+  const cost = mediaPath ? "~$0.02" : "~$0.01";
+  console.error(`\n📊 1 tweet created${mediaPath ? " with media" : ""} · est. cost ${cost}`);
 }
 
 async function cmdReply() {
+  const mediaPath = getOpt("media");
   const tweetId = args[1];
   const text = args.slice(2).join(" ");
   if (!tweetId || !text) {
-    console.error("Usage: x.ts reply <tweet_id_or_url> <text>");
+    console.error("Usage: x.ts reply <tweet_id_or_url> <text> [--media <filepath>]");
     process.exit(1);
   }
   if (text.length > 25000) {
@@ -422,18 +440,28 @@ async function cmdReply() {
     process.exit(1);
   }
 
+  let mediaIds: string[] | undefined;
+  if (mediaPath) {
+    console.error(`Uploading ${mediaPath}...`);
+    const upload = await api.uploadMedia(mediaPath);
+    mediaIds = [upload.media_id_string];
+    console.error(`Uploaded: ${upload.media_id_string} (${(upload.size / 1024).toFixed(0)}KB ${upload.media_type})`);
+  }
+
   // Extract tweet ID from URL if needed
-  const id = tweetId.match(/status\/(\d+)/)?.[1] || tweetId;
-  const result = await api.replyToTweet(text, id);
+  const id = api.extractTweetId(tweetId);
+  const result = await api.replyToTweet(text, id, { mediaIds });
   console.log(`Replied: ${result.tweet_url}`);
-  console.error(`\n📊 1 reply created · est. cost ~$0.01`);
+  const cost = mediaPath ? "~$0.02" : "~$0.01";
+  console.error(`\n📊 1 reply created${mediaPath ? " with media" : ""} · est. cost ${cost}`);
 }
 
 async function cmdQuote() {
+  const mediaPath = getOpt("media");
   const tweetUrlOrId = args[1];
   const text = args.slice(2).join(" ");
   if (!tweetUrlOrId || !text) {
-    console.error("Usage: x.ts quote <tweet_url_or_id> <text>");
+    console.error("Usage: x.ts quote <tweet_url_or_id> <text> [--media <filepath>]");
     process.exit(1);
   }
   if (text.length > 25000) {
@@ -441,9 +469,18 @@ async function cmdQuote() {
     process.exit(1);
   }
 
-  const result = await api.quoteTweet(text, tweetUrlOrId);
+  let mediaIds: string[] | undefined;
+  if (mediaPath) {
+    console.error(`Uploading ${mediaPath}...`);
+    const upload = await api.uploadMedia(mediaPath);
+    mediaIds = [upload.media_id_string];
+    console.error(`Uploaded: ${upload.media_id_string} (${(upload.size / 1024).toFixed(0)}KB ${upload.media_type})`);
+  }
+
+  const result = await api.quoteTweet(text, tweetUrlOrId, { mediaIds });
   console.log(`Quoted: ${result.tweet_url}`);
-  console.error(`\n📊 1 quote tweet created · est. cost ~$0.01`);
+  const cost = mediaPath ? "~$0.02" : "~$0.01";
+  console.error(`\n📊 1 quote tweet created${mediaPath ? " with media" : ""} · est. cost ${cost}`);
 }
 
 async function cmdDelete() {
@@ -489,10 +526,12 @@ async function cmdThreadPost() {
   }
 
   // Parse thread: split on ## Tweet N headers (matching draft format)
+  // First section (before any ## Tweet header) is preamble — skip it
   const tweetTexts: string[] = [];
   const sections = content.split(/^## Tweet \d+.*$/m);
-  for (const section of sections) {
-    const trimmed = section.trim();
+  for (let i = 0; i < sections.length; i++) {
+    if (i === 0) continue; // skip preamble (title, metadata, etc.)
+    const trimmed = sections[i].trim();
     if (trimmed) tweetTexts.push(trimmed);
   }
 
@@ -593,6 +632,98 @@ async function cmdUnfollow() {
   console.log(`Unfollowed @${username}`);
 }
 
+async function cmdUpload() {
+  const filePath = args[1];
+  if (!filePath) {
+    console.error("Usage: x.ts upload <filepath>");
+    process.exit(1);
+  }
+  const result = await api.uploadMedia(filePath);
+  // Print media_id to stdout (for piping)
+  console.log(result.media_id_string);
+  console.error(`\n📊 Uploaded: ${(result.size / 1024).toFixed(0)}KB ${result.media_type} · est. cost ~$0.01`);
+}
+
+async function cmdBookmarks() {
+  const limit = parseInt(getOpt("limit") || "20");
+  const asJson = getFlag("json");
+
+  const tweets = await api.listBookmarks({ maxResults: limit });
+
+  if (asJson) {
+    console.log(JSON.stringify(tweets, null, 2));
+  } else if (tweets.length === 0) {
+    console.log("No bookmarks found.");
+  } else {
+    console.log(`📑 Bookmarks (${tweets.length})\n`);
+    console.log(fmt.formatResultsTelegram(tweets, { limit }));
+  }
+
+  const cost = (tweets.length * 0.005).toFixed(2);
+  console.error(`\n📊 ${tweets.length} bookmarks read · est. cost ~$${cost}`);
+}
+
+async function cmdBookmark() {
+  const tweetId = args[1];
+  if (!tweetId) {
+    console.error("Usage: x.ts bookmark <tweet_id_or_url>");
+    process.exit(1);
+  }
+  const id = api.extractTweetId(tweetId);
+  await api.bookmarkTweet(id);
+  console.log(`Bookmarked tweet ${id}`);
+  console.error(`\n📊 1 bookmark action · est. cost ~$0.01`);
+}
+
+async function cmdUnbookmark() {
+  const tweetId = args[1];
+  if (!tweetId) {
+    console.error("Usage: x.ts unbookmark <tweet_id_or_url>");
+    process.exit(1);
+  }
+  const id = api.extractTweetId(tweetId);
+  await api.unbookmarkTweet(id);
+  console.log(`Unbookmarked tweet ${id}`);
+  console.error(`\n📊 1 unbookmark action · est. cost ~$0.01`);
+}
+
+async function cmdDM() {
+  const username = args[1]?.replace(/^@/, "");
+  const text = args.slice(2).join(" ");
+  if (!username || !text) {
+    console.error("Usage: x.ts dm <username> <text>");
+    process.exit(1);
+  }
+
+  console.error(`Looking up @${username}...`);
+  const userId = await api.getUserId(username);
+  const result = await api.sendDM(userId, text);
+  console.log(`DM sent to @${username} (conversation: ${result.dm_conversation_id})`);
+  console.error(`\n📊 1 user lookup + 1 DM sent · est. cost ~$0.02`);
+}
+
+async function cmdDMs() {
+  const limit = parseInt(getOpt("limit") || "20");
+  const asJson = getFlag("json");
+  const conversationId = args[1]; // optional: specific conversation
+
+  let events: api.DMEvent[];
+  if (conversationId && !conversationId.startsWith("--")) {
+    events = await api.listConversationEvents(conversationId, { maxResults: limit });
+  } else {
+    events = await api.listDMEvents({ maxResults: limit });
+  }
+
+  if (asJson) {
+    console.log(JSON.stringify(events, null, 2));
+  } else {
+    console.log(fmt.formatDMEventsList(events));
+  }
+
+  const cost = (events.length * 0.005).toFixed(2);
+  console.error(`\n📊 ${events.length} DM events read · est. cost ~$${cost}`);
+}
+
 async function cmdCache() {
   const sub = args[1];
   if (sub === "clear") {
@@ -605,24 +736,31 @@ async function cmdCache() {
 }
 
 function usage() {
-  console.log(`x — X/Twitter research, posting & engagement CLI
+  console.log(`x — X/Twitter research, posting, engagement, media, bookmarks & DMs
 
 Commands:
   search <query> [options]    Search tweets (recent or full-archive)
   thread <tweet_id>           Fetch full conversation thread
   profile <username>          Recent tweets from a user
   tweet <tweet_id>            Fetch a single tweet
-  post <text>                 Post a new tweet
-  reply <tweet_id> <text>     Reply to a tweet
-  quote <tweet_url> <text>    Quote tweet
+  post <text> [--media path]  Post a new tweet (optionally with image)
+  reply <id> <text> [--media] Reply to a tweet
+  quote <url> <text> [--media] Quote tweet
   delete <tweet_id>           Delete a tweet
   thread-post --file <path>   Post a multi-tweet thread
+  upload <filepath>           Upload image, print media_id
   like <tweet_id>             Like a tweet
   unlike <tweet_id>           Unlike a tweet
   repost <tweet_id>           Repost (retweet) a tweet
   unrepost <tweet_id>         Undo a repost
   follow <username>           Follow a user
   unfollow <username>         Unfollow a user
+  bookmarks [--limit N]       List bookmarks (alias: bm)
+  bookmark <tweet_id>         Bookmark a tweet
+  unbookmark <tweet_id>       Remove a bookmark
+  dm <username> <text>        Send a direct message
+  dms [--limit N]             List recent DM events
+  dms <conversation_id>       List events in a conversation
   watchlist                   Show watchlist
   watchlist add <user> [note] Add user to watchlist
   watchlist remove <user>     Remove user from watchlist
@@ -642,9 +780,12 @@ Search options:
   --quality                  Pre-filter low-engagement tweets (min_faves:10)
   --archive                  Full-archive search (all time, back to 2006)
   --no-replies               Exclude replies
-  --save                     Save to ~/clawd/drafts/
+  --save                     Save to ~/.claude/drafts/
   --json                     Raw JSON output
   --markdown                 Markdown output
+
+Media: --media <filepath> on post/reply/quote. Images only (JPEG/PNG/GIF/WebP, max 5MB).
+Bookmarks/DMs: May require OAuth 2.0 PKCE (403 = needs PKCE, not yet implemented).
 
 Write/engagement commands require OAuth 1.0a creds in ~/keys/:
   X_API_KEY.txt, X_API_SECRET.txt, X_ACCESS_TOKEN.txt, X_ACCESS_TOKEN_SECRET.txt`);
@@ -706,6 +847,25 @@ async function main() {
       break;
     case "unfollow":
       await cmdUnfollow();
+      break;
+    case "upload":
+      await cmdUpload();
+      break;
+    case "bookmarks":
+    case "bm":
+      await cmdBookmarks();
+      break;
+    case "bookmark":
+      await cmdBookmark();
+      break;
+    case "unbookmark":
+      await cmdUnbookmark();
+      break;
+    case "dm":
+      await cmdDM();
+      break;
+    case "dms":
+      await cmdDMs();
       break;
     case "watchlist":
     case "wl":

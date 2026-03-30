@@ -2,7 +2,7 @@
  * Format tweets for Telegram or markdown output.
  */
 
-import type { Tweet } from "./api";
+import type { Tweet, DMEvent } from "./api";
 
 function compactNumber(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -152,6 +152,48 @@ export function formatProfileTelegram(user: any, tweets: Tweet[]): string {
     .slice(0, 10)
     .map((t, i) => formatTweetTelegram(t, i))
     .join("\n\n");
+
+  return out;
+}
+
+// --- DM formatting ---
+
+/**
+ * Format a single DM event.
+ */
+export function formatDMEvent(e: DMEvent): string {
+  const sender = e.sender_username ? `@${e.sender_username}` : `user:${e.sender_id}`;
+  const time = e.created_at ? timeAgo(e.created_at) : "?";
+
+  if (e.event_type !== "MessageCreate") {
+    return `[${e.event_type}] ${sender} (${time})`;
+  }
+
+  return `${sender} (${time}): ${e.text}`;
+}
+
+/**
+ * Format a list of DM events, grouped by conversation.
+ */
+export function formatDMEventsList(events: DMEvent[]): string {
+  if (events.length === 0) return "No DM events found.";
+
+  // Group by conversation
+  const convos = new Map<string, DMEvent[]>();
+  for (const e of events) {
+    const key = e.dm_conversation_id || "unknown";
+    if (!convos.has(key)) convos.set(key, []);
+    convos.get(key)!.push(e);
+  }
+
+  let out = `💬 ${events.length} DM events across ${convos.size} conversation(s)\n`;
+
+  for (const [convoId, convoEvents] of convos) {
+    out += `\n--- Conversation ${convoId.slice(0, 12)}... ---\n`;
+    for (const e of convoEvents) {
+      out += `  ${formatDMEvent(e)}\n`;
+    }
+  }
 
   return out;
 }

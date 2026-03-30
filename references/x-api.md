@@ -193,3 +193,128 @@ DELETE https://api.x.com/2/users/{user_id}/following/{target_user_id}
 ```
 
 Requires looking up the target user ID first via `GET /2/users/by/username/{username}`.
+
+## Media Upload (v1.1)
+
+Uses the v1.1 upload endpoint (not v2). OAuth 1.0a required.
+
+```
+POST https://upload.twitter.com/1.1/media/upload.json
+Content-Type: application/x-www-form-urlencoded
+
+media_data=<base64-encoded-file>&media_category=tweet_image
+```
+
+**Supported types:** JPEG, PNG, GIF (non-animated and animated), WebP
+**Max size:** 5MB for images (video requires chunked upload, not implemented)
+
+**Response:**
+```json
+{
+  "media_id": 710511363345354753,
+  "media_id_string": "710511363345354753",
+  "size": 11065,
+  "expires_after_secs": 86400,
+  "image": {
+    "image_type": "image/jpeg",
+    "w": 800,
+    "h": 418
+  }
+}
+```
+
+**Attaching to tweets:** Include `media_id_string` in the tweet creation body:
+```json
+{
+  "text": "Tweet with image",
+  "media": {
+    "media_ids": ["710511363345354753"]
+  }
+}
+```
+
+Media IDs expire after 24 hours if not attached to a tweet.
+
+**OAuth note:** For multipart/form-data uploads, OAuth signature excludes body params (only signs the URL + OAuth params). For `application/x-www-form-urlencoded`, same rule applies with base64-encoded data.
+
+## Bookmarks
+
+All require OAuth 1.0a (or OAuth 2.0 PKCE - historically PKCE-only, may have changed with pay-per-use).
+
+### List Bookmarks
+
+```
+GET https://api.x.com/2/users/{user_id}/bookmarks
+```
+
+Standard tweet fields/expansions params. Returns bookmarked tweets for the authenticated user.
+
+### Add Bookmark
+
+```
+POST https://api.x.com/2/users/{user_id}/bookmarks
+body: {"tweet_id": "..."}
+```
+
+### Remove Bookmark
+
+```
+DELETE https://api.x.com/2/users/{user_id}/bookmarks/{tweet_id}
+```
+
+## Direct Messages
+
+All require OAuth 1.0a (or OAuth 2.0 PKCE - historically PKCE-only).
+
+### Send DM
+
+```
+POST https://api.x.com/2/dm_conversations/with/{participant_user_id}/messages
+body: {"text": "Hello!"}
+```
+
+Creates a new conversation with the user (or sends in existing 1-on-1 conversation).
+
+**Response:**
+```json
+{
+  "data": {
+    "dm_conversation_id": "...",
+    "dm_event_id": "..."
+  }
+}
+```
+
+### List DM Events
+
+```
+GET https://api.x.com/2/dm_events
+dm_event.fields=id,text,event_type,dm_conversation_id,created_at,sender_id
+expansions=sender_id
+user.fields=username,name
+max_results=20
+```
+
+Returns DM events across all conversations for the authenticated user.
+
+### List Conversation Events
+
+```
+GET https://api.x.com/2/dm_conversations/{dm_conversation_id}/dm_events
+```
+
+Same fields/expansions as above. Returns events for a specific conversation.
+
+### DM Event Types
+
+- `MessageCreate` - a text message
+- `ParticipantsJoin` - user(s) joined a group conversation
+- `ParticipantsLeave` - user(s) left a group conversation
+
+### User Lookup
+
+```
+GET https://api.x.com/2/users/by/username/{username}
+```
+
+Returns user ID and profile info. Used by DM and follow commands to resolve `@username` to a user ID.

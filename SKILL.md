@@ -2,17 +2,22 @@
 name: x-api
 description: >
   Programmatic X/Twitter interaction via API. Search, post, reply, quote-tweet, delete,
-  thread-post, like, repost, follow, monitor accounts, and research topics.
+  thread-post, like, repost, follow, upload media, bookmarks, DMs, monitor accounts,
+  and research topics.
   Use when: (1) user says "x research", "search x", "search twitter", "post to x",
   "tweet", "reply on x", "check x for", "x search", "/x-api",
-  (2) user wants to post tweets, threads, or replies programmatically,
+  (2) user wants to post tweets, threads, or replies programmatically (with optional images),
   (3) user is doing research where recent X discourse provides useful context,
   (4) user wants to monitor accounts or find conversations to engage with,
-  (5) user wants to like, repost, follow, or otherwise engage on X.
-  Supports read (search, profile, thread), write (post, reply, quote, delete, thread-post),
-  and engagement (like, unlike, repost, unrepost, follow, unfollow) via OAuth 1.0a.
+  (5) user wants to like, repost, follow, bookmark, or otherwise engage on X,
+  (6) user wants to send or read direct messages,
+  (7) user wants to upload images for tweets.
+  Supports read (search, profile, thread, bookmarks, dms), write (post, reply, quote, delete,
+  thread-post, upload, dm), and engagement (like, unlike, repost, unrepost, follow, unfollow,
+  bookmark, unbookmark) via OAuth 1.0a.
   Pay-per-use API ($0.01/post, $0.005/read).
   Note: search supports both recent (7 days) and full-archive (all time) via --archive flag.
+  Note: bookmarks and DMs may require OAuth 2.0 PKCE (untested, try OAuth 1.0a first).
 ---
 
 # X Research
@@ -26,9 +31,10 @@ For X API details (endpoints, operators, response format): read `references/x-ap
 All commands run from this skill directory:
 
 ```bash
-cd ~/clawd/skills/x-research
-source ~/.config/env/global.env
+cd ~/.claude/skills/x-api
 ```
+
+Keys are auto-loaded from `~/keys/X_*.txt` files (no env sourcing needed).
 
 ### Search
 
@@ -48,7 +54,7 @@ bun run x.ts search "<query>" [options]
 - `--quality` -- filter low-engagement tweets (>=10 likes, post-hoc)
 - `--archive` -- full-archive search (all time, back to March 2006). Same credits, max 500 results/page, 1024-char query limit.
 - `--no-replies` -- exclude replies
-- `--save` -- save results to `~/clawd/drafts/x-research-{slug}-{date}.md`
+- `--save` -- save results to `~/.claude/drafts/x-research-{slug}-{date}.md`
 - `--json` -- raw JSON output
 - `--markdown` -- markdown output for research docs
 
@@ -164,6 +170,46 @@ bun run x.ts follow <username>
 bun run x.ts unfollow <username>
 ```
 
+### Upload Media
+
+```bash
+bun run x.ts upload <filepath>
+```
+
+Uploads an image file and prints the `media_id_string` to stdout. Use this to pre-upload media, then pass the ID to tweet creation. Supports JPEG, PNG, GIF, WebP. Max 5MB. Uses the v1.1 `upload.twitter.com` endpoint with base64 encoding.
+
+### Post / Reply / Quote with Media
+
+```bash
+bun run x.ts post "Tweet text" --media /path/to/image.jpg
+bun run x.ts reply <tweet_id> "Reply text" --media /path/to/image.png
+bun run x.ts quote <tweet_url> "Quote text" --media /path/to/image.gif
+```
+
+The `--media` flag uploads the image first, then attaches it to the tweet. Images only (no video), max 5MB.
+
+### Bookmarks
+
+```bash
+bun run x.ts bookmarks [--limit N] [--json]   # List bookmarks (alias: bm)
+bun run x.ts bookmark <tweet_id_or_url>        # Bookmark a tweet
+bun run x.ts unbookmark <tweet_id_or_url>      # Remove a bookmark
+```
+
+**Auth note:** Bookmarks may require OAuth 2.0 PKCE instead of OAuth 1.0a. If you get a 403, this endpoint needs PKCE (not yet implemented). The skill tries OAuth 1.0a first since pay-per-use (Feb 2026) may have relaxed the old restriction.
+
+### Direct Messages
+
+```bash
+bun run x.ts dm <username> "Your message"       # Send a DM
+bun run x.ts dms [--limit N] [--json]           # List recent DM events
+bun run x.ts dms <conversation_id> [--limit N]  # List specific conversation
+```
+
+Sends DMs to a user (looks up their user ID first). Lists recent DM events across all conversations, or filters to a specific conversation ID.
+
+**Auth note:** DMs may require OAuth 2.0 PKCE. Same caveat as bookmarks - 403 means PKCE needed.
+
 ### Watchlist
 
 ```bash
@@ -185,9 +231,11 @@ bun run x.ts cache clear    # Clear all cached results
 
 ## Authentication
 
-**Read operations** (search, profile, thread, tweet) use `X_BEARER_TOKEN` (app-level, read-only).
+**All operations** use OAuth 1.0a user credentials. Bearer token auth was removed because Pay Per Use accounts have a known X platform bug where bearer tokens return 403 ("client not attached to project").
 
-**Write and engagement operations** (post, reply, quote, delete, thread-post, like, unlike, repost, unrepost, follow, unfollow) require OAuth 1.0a user credentials:
+**Note:** Media upload uses the v1.1 endpoint (`upload.twitter.com`), not v2. Bookmarks and DMs historically required OAuth 2.0 PKCE. The skill tries OAuth 1.0a first (pay-per-use may have relaxed the restriction). If you get a 403, the endpoint needs PKCE (not yet implemented).
+
+**Media upload uses `multipart/form-data`** <!-- added: 2026-03-07 -->: The v1.1 media upload endpoint requires multipart/form-data (not form-urlencoded). With multipart, body params are excluded from the OAuth 1.0a signature per RFC 5849, so `buildOAuthHeader` works without modifications.
 
 | Key | File | Source |
 |-----|------|--------|
@@ -196,13 +244,15 @@ bun run x.ts cache clear    # Clear all cached results
 | `X_ACCESS_TOKEN` | `~/keys/X_ACCESS_TOKEN.txt` | Console -> Apps -> OAuth 1.0 Keys -> Access Token |
 | `X_ACCESS_TOKEN_SECRET` | `~/keys/X_ACCESS_TOKEN_SECRET.txt` | Console -> Apps -> OAuth 1.0 Keys -> Access Token Secret |
 
-<!-- last-verified: 2026-02-17 -->
+<!-- last-verified: 2026-03-04 -->
 **Console**: https://console.x.com/accounts (NOT the old developer.x.com portal)
 **App**: mac-mcp-app (Pay Per Use, app ID 32419503)
 
 The app needs **Read and Write** permissions (not just Read). Set under Apps -> mac-mcp-app -> Authentication settings.
 
 **Gotcha**: Consumer Key is server-side masked even when "Show" is clicked. Must click "Regenerate" to see the full value. Same for Access Token - click "Generate" to create with current permissions.
+
+**Bearer token (`X_BEARER_TOKEN`)** is no longer used but the file remains at `~/keys/X_BEARER_TOKEN.txt`. If X fixes the Pay Per Use bearer token bug in the future, reads could be switched back for simpler auth.
 
 ## Research Loop (Agentic)
 
@@ -260,7 +310,7 @@ Resources shared:
 
 ### 6. Save
 
-Use `--save` flag or save manually to `~/clawd/drafts/x-research-{topic-slug}-{YYYY-MM-DD}.md`.
+Use `--save` flag or save manually to `~/.claude/drafts/x-research-{topic-slug}-{YYYY-MM-DD}.md`.
 
 ## Refinement Heuristics
 
@@ -297,6 +347,12 @@ X API is pay-per-use ($0.005/tweet read, $0.01/user lookup). Every command print
 | `like` / `unlike` | ~$0.01 | Engagement action |
 | `repost` / `unrepost` | ~$0.01 | Engagement action |
 | `follow` / `unfollow` | ~$0.02 | User lookup + follow action |
+| `upload` | ~$0.01 | Single media upload |
+| `post --media` | ~$0.02 | Upload + post |
+| `bookmarks` | ~$0.10/20 | $0.005/tweet read |
+| `bookmark` / `unbookmark` | ~$0.01 | Engagement action |
+| `dm` | ~$0.02 | User lookup + message send |
+| `dms` | ~$0.10/20 | $0.005/event read |
 | Cached repeat | $0 | 15min TTL (1hr in quick mode) |
 
 **Cost control rules:**

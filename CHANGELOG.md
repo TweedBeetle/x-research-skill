@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.4.0 (2026-03-04)
+
+### Fixed — Bearer Token 403 on Pay Per Use Accounts
+Pay Per Use X API accounts have a known platform bug where bearer tokens return 403 ("client_id not attached to a Project"). This affected all read operations (search, profile, thread, tweet). Deleted the old Free-tier app (client_id 30672451) that was polluting the bearer token, but the bug persisted even after regeneration.
+
+- **Switched all read operations to OAuth 1.0a** — `apiGet` now uses the same OAuth 1.0a signing as write operations instead of bearer token auth
+- **Fixed OAuth signature for GET requests** — `buildOAuthHeader` now includes URL query parameters in the signature base string (required by OAuth 1.0a spec)
+- **Updated auth docs** — SKILL.md and README.md reflect that all operations use OAuth 1.0a
+- **Removed stale path references** — `~/clawd/drafts/` → `~/.claude/drafts/`, `~/clawd/skills/x-research` → `~/.claude/skills/x-api`, removed `source ~/.config/env/global.env`
+
 ## v2.3.0 (2026-02-09)
 
 ### Fixed — Remove LLM Hallucinations
@@ -57,7 +67,7 @@ Most LLMs have the old X API tier system (Basic/Pro/Enterprise, $200/mo subscrip
 - **Auto noise filtering** — `-is:retweet` added by default unless already in query
 - **Engagement sorting** — `--sort likes|impressions|retweets|recent`
 - **Post-hoc filtering** — `--min-likes N` and `--min-impressions N` (since X API doesn't support these as search operators)
-- **Save to file** — `--save` flag auto-saves research to `~/clawd/drafts/`
+- **Save to file** — `--save` flag auto-saves research to `~/.claude/drafts/`
 - **Multiple output formats** — `--json` for raw data, `--markdown` for research docs, default for Telegram
 
 ### Changed
