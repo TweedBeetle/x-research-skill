@@ -16,7 +16,9 @@
  *   reply <tweet_id> <text>     Reply to a tweet
  *   quote <tweet_url> <text>    Quote tweet
  *   delete <tweet_id>           Delete a tweet
- *   thread-post --file <path>   Post a multi-tweet thread
+ *   thread-post --file <path>   Post a multi-tweet thread (resumable)
+ *   article-draft --title T --file P [--publish]  Draft/publish a long-form Article
+ *   article-publish <id>        Publish a previously-drafted Article
  *   like <tweet_id>             Like a tweet
  *   unlike <tweet_id>           Unlike a tweet
  *   repost <tweet_id>           Repost (retweet) a tweet
@@ -48,7 +50,7 @@
  *   --markdown                 Output as markdown (for research docs)
  */
 
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from "fs";
 import { join } from "path";
 import * as api from "./lib/api";
 import * as cache from "./lib/cache";
@@ -57,6 +59,28 @@ import * as fmt from "./lib/format";
 const SKILL_DIR = import.meta.dir;
 const WATCHLIST_PATH = join(SKILL_DIR, "data", "watchlist.json");
 const DRAFTS_DIR = join(process.env.HOME!, ".claude", "drafts");
+
+// --- Pricing (X API pay-per-use, updated 2026-04-16) ---
+// ⚠️ A post that CONTAINS A URL costs $0.20 — 13x the $0.015 base. See postCost().
+const COST = {
+  postCreate: 0.015, // create a post/reply/quote (no URL)
+  postWithUrl: 0.2, // create a post that contains a URL — 13x the base
+  summonedReply: 0.01, // reply to someone else's post after being summoned
+  postRead: 0.005, // read someone else's post
+  ownedRead: 0.001, // read your own post
+  userLookup: 0.01, // look up a user
+  dmCreate: 0.015, // send a DM
+  dmRead: 0.01, // read a DM event
+};
+
+function hasUrl(text: string): boolean {
+  return /https?:\/\/\S+/i.test(text);
+}
+
+/** Create-cost for a post, accounting for the 13x URL surcharge. */
+function postCost(text: string): number {
+  return hasUrl(text) ? COST.postWithUrl : COST.postCreate;
+}
 
 // --- Arg parsing ---
 
@@ -109,6 +133,8 @@ async function cmdSearch() {
 
   const sortOpt = getOpt("sort") || "likes";
   const minLikes = parseInt(getOpt("min-likes") || "0");
+  const minReplies = parseInt(getOpt("min-replies") || "0");
+  const minReposts = parseInt(getOpt("min-reposts") || "0");
   const minImpressions = parseInt(getOpt("min-impressions") || "0");
   let pages = Math.min(parseInt(getOpt("pages") || "1"), 5);
   let limit = parseInt(getOpt("limit") || "15");
@@ -139,7 +165,10 @@ async function cmdSearch() {
     query += ` from:${fromUser.replace(/^@/, "")}`;
   }
 
-  // Auto-add noise filters unless already present
+  // Auto-add noise filters unless already present.
+  // Note: since the 2026-05-04 index migration, retweets are no longer returned in
+  // keyword search anyway, so -is:retweet is mostly a no-op on recent search (kept for
+  // --archive and for explicit is:retweet queries).
   if (!query.includes("is:retweet") && !noRetweets) {
     query += " -is:retweet";
   }
@@ -148,6 +177,15 @@ async function cmdSearch() {
   } else if (noReplies && !query.includes("is:reply")) {
     query += " -is:reply";
   }
+
+  // Native precision operators (added by the 2026-05-04 search index migration).
+  // Prefer server-side filtering over post-hoc: it is both more accurate AND cheaper
+  // (fewer post reads billed). There is no native operator for impressions, so that
+  // one stays post-hoc below.
+  if (minLikes > 0 && !/\bmin_likes:/.test(query)) query += ` min_likes:${minLikes}`;
+  if (quality && !/\bmin_likes:/.test(query)) query += " min_likes:10";
+  if (minReplies > 0 && !/\bmin_replies:/.test(query)) query += ` min_replies:${minReplies}`;
+  if (minReposts > 0 && !/\bmin_reposts:/.test(query)) query += ` min_reposts:${minReposts}`;
 
   // Cache TTL: 1hr for quick mode, 15min default
   const cacheTtlMs = quick ? 3_600_000 : 900_000;
@@ -173,17 +211,10 @@ async function cmdSearch() {
   // Track raw count for cost (API charges per tweet read, regardless of post-hoc filters)
   const rawTweetCount = tweets.length;
 
-  // Filter
-  if (minLikes > 0 || minImpressions > 0) {
-    tweets = api.filterEngagement(tweets, {
-      minLikes: minLikes || undefined,
-      minImpressions: minImpressions || undefined,
-    });
-  }
-
-  // --quality: post-hoc filter for min 10 likes (min_faves not available as a search operator)
-  if (quality) {
-    tweets = api.filterEngagement(tweets, { minLikes: 10 });
+  // Post-hoc filter only for impressions (no native operator exists). min-likes,
+  // --quality, min-replies and min-reposts are applied server-side as native operators above.
+  if (minImpressions > 0) {
+    tweets = api.filterEngagement(tweets, { minImpressions });
   }
 
   // Sort
@@ -223,7 +254,7 @@ async function cmdSearch() {
   }
 
   // Cost display (based on raw API reads, not post-filter count)
-  const cost = (rawTweetCount * 0.005).toFixed(2);
+  const cost = (rawTweetCount * COST.postRead).toFixed(2);
   if (quick) {
     console.error(`\n⚡ quick mode · ${rawTweetCount} tweets read (~$${cost})`);
   } else {
@@ -259,8 +290,8 @@ async function cmdThread() {
     console.log();
   }
 
-  // Cost: root tweet lookup ($0.005) + search pages ($0.005/tweet)
-  const cost = ((tweets.length) * 0.005 + 0.005).toFixed(2);
+  // Cost: root tweet lookup + search pages, all billed as post reads ($0.005 each)
+  const cost = ((tweets.length + 1) * COST.postRead).toFixed(2);
   console.error(`\n📊 ${tweets.length} tweets read · est. cost ~$${cost}`);
 }
 
@@ -287,7 +318,7 @@ async function cmdProfile() {
   }
 
   // Cost: 1 user lookup ($0.01) + tweet reads ($0.005 each)
-  const cost = (0.01 + tweets.length * 0.005).toFixed(2);
+  const cost = (COST.userLookup + tweets.length * COST.postRead).toFixed(2);
   console.error(`\n📊 1 user + ${tweets.length} tweets read · est. cost ~$${cost}`);
 }
 
@@ -311,7 +342,7 @@ async function cmdTweet() {
     console.log(fmt.formatTweetTelegram(tweet, undefined, { full: true }));
   }
 
-  console.error(`\n📊 1 tweet read · est. cost ~$0.01`);
+  console.error(`\n📊 1 tweet read · est. cost ~$${COST.postRead.toFixed(3)}`);
 }
 
 async function cmdWatchlist() {
@@ -384,7 +415,7 @@ async function cmdWatchlist() {
       }
     }
     // Cost: 1 user lookup ($0.01) + tweets per account
-    const cost = (wl.accounts.length * 0.01 + totalTweets * 0.005).toFixed(2);
+    const cost = (wl.accounts.length * COST.userLookup + totalTweets * COST.postRead).toFixed(2);
     console.error(`\n📊 ${wl.accounts.length} accounts, ${totalTweets} tweets read · est. cost ~$${cost}`);
     return;
   }
@@ -413,6 +444,10 @@ async function cmdPost() {
     process.exit(1);
   }
 
+  if (hasUrl(text)) {
+    console.error(`⚠️ This post contains a URL → it costs $0.20 (13x the $0.015 base). To keep the hook cheap and high-reach, put the link in a self-reply instead.`);
+  }
+
   let mediaIds: string[] | undefined;
   if (mediaPath) {
     console.error(`Uploading ${mediaPath}...`);
@@ -423,8 +458,8 @@ async function cmdPost() {
 
   const result = await api.createTweet(text, { mediaIds });
   console.log(`Posted: ${result.tweet_url}`);
-  const cost = mediaPath ? "~$0.02" : "~$0.01";
-  console.error(`\n📊 1 tweet created${mediaPath ? " with media" : ""} · est. cost ${cost}`);
+  const warn = hasUrl(text) ? "  ⚠️ URL post (13x)" : "";
+  console.error(`\n📊 1 tweet created${mediaPath ? " with media" : ""} · est. cost ~$${postCost(text).toFixed(3)}${warn}`);
 }
 
 async function cmdReply() {
@@ -440,6 +475,10 @@ async function cmdReply() {
     process.exit(1);
   }
 
+  if (hasUrl(text)) {
+    console.error(`⚠️ This reply contains a URL → it costs $0.20 (13x the $0.015 base).`);
+  }
+
   let mediaIds: string[] | undefined;
   if (mediaPath) {
     console.error(`Uploading ${mediaPath}...`);
@@ -452,8 +491,8 @@ async function cmdReply() {
   const id = api.extractTweetId(tweetId);
   const result = await api.replyToTweet(text, id, { mediaIds });
   console.log(`Replied: ${result.tweet_url}`);
-  const cost = mediaPath ? "~$0.02" : "~$0.01";
-  console.error(`\n📊 1 reply created${mediaPath ? " with media" : ""} · est. cost ${cost}`);
+  const warn = hasUrl(text) ? "  ⚠️ URL post (13x)" : "";
+  console.error(`\n📊 1 reply created${mediaPath ? " with media" : ""} · est. cost ~$${postCost(text).toFixed(3)}${warn}`);
 }
 
 async function cmdQuote() {
@@ -469,6 +508,10 @@ async function cmdQuote() {
     process.exit(1);
   }
 
+  if (hasUrl(text)) {
+    console.error(`⚠️ This quote contains a URL → it costs $0.20 (13x the $0.015 base).`);
+  }
+
   let mediaIds: string[] | undefined;
   if (mediaPath) {
     console.error(`Uploading ${mediaPath}...`);
@@ -479,8 +522,8 @@ async function cmdQuote() {
 
   const result = await api.quoteTweet(text, tweetUrlOrId, { mediaIds });
   console.log(`Quoted: ${result.tweet_url}`);
-  const cost = mediaPath ? "~$0.02" : "~$0.01";
-  console.error(`\n📊 1 quote tweet created${mediaPath ? " with media" : ""} · est. cost ${cost}`);
+  const warn = hasUrl(text) ? "  ⚠️ URL post (13x)" : "";
+  console.error(`\n📊 1 quote tweet created${mediaPath ? " with media" : ""} · est. cost ~$${postCost(text).toFixed(3)}${warn}`);
 }
 
 async function cmdDelete() {
@@ -502,6 +545,8 @@ async function cmdDelete() {
 
 async function cmdThreadPost() {
   const filePath = getOpt("file");
+  const stateOpt = getOpt("state");
+  const fresh = getFlag("fresh");
   let content: string;
 
   if (filePath) {
@@ -558,13 +603,33 @@ async function cmdThreadPost() {
     process.exit(1);
   }
 
+  // Resumable state: a mid-chain failure can be resumed (no double-posting) by re-running
+  // the same command. State defaults to <file>.thread-state.json; --state overrides;
+  // --fresh discards any prior state and starts over.
+  const stateFile =
+    stateOpt || (filePath ? `${filePath}.thread-state.json` : join(DRAFTS_DIR, "x-thread-state.json"));
+  if (fresh && existsSync(stateFile)) unlinkSync(stateFile);
+
+  const resuming = existsSync(stateFile);
+  if (resuming) {
+    console.error(`Resuming from ${stateFile} (already-posted tweets will be skipped)...`);
+  }
+
+  const urlTweets = tweetTexts.filter(hasUrl).length;
+  if (urlTweets > 0) {
+    console.error(`⚠️ ${urlTweets} of ${tweetTexts.length} tweets contain a URL → $0.20 each (13x). Isolate links to a single self-reply to pay the penalty only once.`);
+  }
   console.error(`Posting thread (${tweetTexts.length} tweets)...`);
 
-  const results = await api.postThread(tweetTexts);
-  for (const r of results) {
-    console.log(`${r.tweet_url}`);
-  }
-  const cost = (results.length * 0.01).toFixed(2);
+  const results = await api.postThread(tweetTexts, {
+    stateFile,
+    onProgress: (r) => console.log(`${r.tweet_url}`),
+  });
+
+  // Full success — remove the resume file so a later re-run doesn't think it's done.
+  if (existsSync(stateFile)) unlinkSync(stateFile);
+
+  const cost = tweetTexts.reduce((sum, t) => sum + postCost(t), 0).toFixed(3);
   console.error(`\n📊 ${results.length} tweets posted · est. cost ~$${cost}`);
 }
 
@@ -635,13 +700,15 @@ async function cmdUnfollow() {
 async function cmdUpload() {
   const filePath = args[1];
   if (!filePath) {
-    console.error("Usage: x.ts upload <filepath>");
+    console.error("Usage: x.ts upload <filepath>   (images JPEG/PNG/GIF/WebP, video MP4/MOV)");
     process.exit(1);
   }
   const result = await api.uploadMedia(filePath);
   // Print media_id to stdout (for piping)
   console.log(result.media_id_string);
-  console.error(`\n📊 Uploaded: ${(result.size / 1024).toFixed(0)}KB ${result.media_type} · est. cost ~$0.01`);
+  console.error(
+    `\n📊 Uploaded: ${(result.size / 1024).toFixed(0)}KB ${result.media_type} (media upload is not separately metered in the pay-per-use pricing table)`
+  );
 }
 
 async function cmdBookmarks() {
@@ -659,7 +726,7 @@ async function cmdBookmarks() {
     console.log(fmt.formatResultsTelegram(tweets, { limit }));
   }
 
-  const cost = (tweets.length * 0.005).toFixed(2);
+  const cost = (tweets.length * COST.postRead).toFixed(2);
   console.error(`\n📊 ${tweets.length} bookmarks read · est. cost ~$${cost}`);
 }
 
@@ -699,7 +766,7 @@ async function cmdDM() {
   const userId = await api.getUserId(username);
   const result = await api.sendDM(userId, text);
   console.log(`DM sent to @${username} (conversation: ${result.dm_conversation_id})`);
-  console.error(`\n📊 1 user lookup + 1 DM sent · est. cost ~$0.02`);
+  console.error(`\n📊 1 user lookup + 1 DM sent · est. cost ~$${(COST.userLookup + COST.dmCreate).toFixed(3)}`);
 }
 
 async function cmdDMs() {
@@ -720,8 +787,56 @@ async function cmdDMs() {
     console.log(fmt.formatDMEventsList(events));
   }
 
-  const cost = (events.length * 0.005).toFixed(2);
+  const cost = (events.length * COST.dmRead).toFixed(2);
   console.error(`\n📊 ${events.length} DM events read · est. cost ~$${cost}`);
+}
+
+async function cmdArticleDraft() {
+  const filePath = getOpt("file");
+  const title = getOpt("title");
+  const publish = getFlag("publish");
+
+  let bodyText: string;
+  if (filePath) {
+    if (!existsSync(filePath)) {
+      console.error(`File not found: ${filePath}`);
+      process.exit(1);
+    }
+    bodyText = readFileSync(filePath, "utf-8");
+  } else {
+    bodyText = args.slice(1).filter((a) => !a.startsWith("--")).join(" ");
+  }
+
+  if (!title) {
+    console.error('Usage: x.ts article-draft --title "..." --file <path.md> [--publish]');
+    console.error("  Requires an X Premium account. Body is markdown-ish (paragraphs, # headers, - lists, [links](url)).");
+    process.exit(1);
+  }
+  if (!bodyText.trim()) {
+    console.error("Article body is empty. Pass --file <path.md> or inline text.");
+    process.exit(1);
+  }
+
+  const draft = await api.draftArticle(title, bodyText);
+  console.log(`Drafted article ${draft.id}${draft.url ? `: ${draft.url}` : ""}`);
+  console.error(`\n📊 1 article draft created (article pricing is not separately published; check the console)`);
+
+  if (publish) {
+    const pub = await api.publishArticle(draft.id);
+    console.log(`Published: ${pub.url || pub.id}`);
+    console.error(`📊 1 article published`);
+  }
+}
+
+async function cmdArticlePublish() {
+  const articleId = args[1];
+  if (!articleId || articleId.startsWith("--")) {
+    console.error("Usage: x.ts article-publish <article_id>");
+    process.exit(1);
+  }
+  const pub = await api.publishArticle(articleId);
+  console.log(`Published: ${pub.url || pub.id}`);
+  console.error(`\n📊 1 article published`);
 }
 
 async function cmdCache() {
@@ -743,12 +858,14 @@ Commands:
   thread <tweet_id>           Fetch full conversation thread
   profile <username>          Recent tweets from a user
   tweet <tweet_id>            Fetch a single tweet
-  post <text> [--media path]  Post a new tweet (optionally with image)
+  post <text> [--media path]  Post a new tweet (optionally with image/video)
   reply <id> <text> [--media] Reply to a tweet
   quote <url> <text> [--media] Quote tweet
   delete <tweet_id>           Delete a tweet
-  thread-post --file <path>   Post a multi-tweet thread
-  upload <filepath>           Upload image, print media_id
+  thread-post --file <path>   Post a multi-tweet thread (resumable; --state <f>, --fresh)
+  article-draft --title T --file P [--publish]  Draft (+publish) a long-form Article (Premium)
+  article-publish <id>        Publish a previously-drafted Article
+  upload <filepath>           Upload image or video, print media_id
   like <tweet_id>             Like a tweet
   unlike <tweet_id>           Unlike a tweet
   repost <tweet_id>           Repost (retweet) a tweet
@@ -770,8 +887,10 @@ Commands:
 Search options:
   --sort likes|impressions|retweets|recent   (default: likes)
   --since 1h|3h|12h|1d|7d   Time filter (default: last 7 days)
-  --min-likes N              Filter minimum likes
-  --min-impressions N        Filter minimum impressions
+  --min-likes N              Native min_likes: operator (server-side)
+  --min-replies N            Native min_replies: operator (server-side)
+  --min-reposts N            Native min_reposts: operator (server-side)
+  --min-impressions N        Filter minimum impressions (post-hoc; no native operator)
   --pages N                  Pages to fetch, 1-5 (default: 1)
   --limit N                  Results to display (default: 15)
   --quick                    Quick mode: 1 page, max 10 results, auto noise
@@ -784,8 +903,10 @@ Search options:
   --json                     Raw JSON output
   --markdown                 Markdown output
 
-Media: --media <filepath> on post/reply/quote. Images only (JPEG/PNG/GIF/WebP, max 5MB).
-Bookmarks/DMs: May require OAuth 2.0 PKCE (403 = needs PKCE, not yet implemented).
+Media: --media <filepath> on post/reply/quote. Images (JPEG/PNG/GIF/WebP, max 5MB) and
+       video (MP4/MOV, chunked) via the v2 /2/media/upload endpoint.
+⚠️ Posts containing a URL cost $0.20 (13x the $0.015 base). Isolate links to a self-reply.
+DMs: need a console app-permission bump ("Read, Write, and Direct Messages") + token regen.
 
 Write/engagement commands require OAuth 1.0a creds in ~/keys/:
   X_API_KEY.txt, X_API_SECRET.txt, X_ACCESS_TOKEN.txt, X_ACCESS_TOKEN_SECRET.txt`);
@@ -866,6 +987,12 @@ async function main() {
       break;
     case "dms":
       await cmdDMs();
+      break;
+    case "article-draft":
+      await cmdArticleDraft();
+      break;
+    case "article-publish":
+      await cmdArticlePublish();
       break;
     case "watchlist":
     case "wl":

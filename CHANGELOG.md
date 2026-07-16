@@ -1,5 +1,26 @@
 # Changelog
 
+## v2.5.0 (2026-07-16)
+
+### Mid-2026 X API freshen-up (verified against live docs)
+
+- **Pricing (Apr 16, 2026 update).** All cost figures corrected: post create $0.015, **post containing a URL $0.20 (13x)**, summoned reply $0.010, post read $0.005, owned read $0.001, user lookup $0.010, DM create $0.015, DM read $0.010. Cost constants single-sourced into a `COST` object in `x.ts`; `post`/`reply`/`quote`/`thread-post` detect URLs and warn about the 13x price before posting. (`tweet` read cost corrected from $0.01 → $0.005.)
+- **Articles (long-form) support.** New `article-draft` / `article-publish` commands wrapping `POST /2/articles/draft` + `POST /2/articles/{id}/publish` (launched 2026-06-11, Premium account required, no edit/delete endpoints yet). Includes a simple markdown-ish → DraftJS content-state builder (paragraphs, `#`/`##`/`###` headers, `-` lists, `[text](url)` links).
+- **Media upload migrated to v2.** `POST /2/media/upload` replaces the sunset (2025-06-09) v1.1 `upload.twitter.com` endpoint. Simple single-request path for images/small GIFs; chunked INIT/APPEND/FINALIZE/STATUS path for **video** (MP4/MOV, up to 512MB) — new capability.
+- **Retry/backoff.** The client honors `x-rate-limit-reset` / `Retry-After` on 429 and applies bounded exponential backoff on 5xx. Content-creating POSTs skip 5xx retry (double-post safety) but still retry 429; reads/deletes/engagement retry both.
+- **Resumable threads.** `thread-post` persists each posted tweet id to a state file (`<file>.thread-state.json`, or `--state`); a mid-chain failure resumes rather than double-posts. `--fresh` discards prior state.
+- **Search modernization (2026-05-04 index migration).** `--min-likes` / `--quality` / new `--min-replies` / `--min-reposts` now emit native `min_likes:` / `min_replies:` / `min_reposts:` operators (server-side, cheaper) instead of post-hoc filtering; `--min-impressions` stays post-hoc (no native operator). Retweets are excluded from keyword search under the new index.
+- **Docs.** SKILL.md + references/x-api.md updated (pricing, Articles, v2 media, reply-summon restriction, search operators); added a "Live smoke-test checklist" for the parts that need a real (paid) post to confirm: thread self-chaining under the 2026-02-23 reply-summon restriction, v2 media (esp. video), the Articles draft+publish round trip, and retry behavior.
+
+## v2.4.1 (2026-07-10)
+
+### Docs — Verified auth/credit state + X MCP verdict
+Live re-probe after a $5 credit top-up cleared a `402 CreditsDepleted` outage (the whole pay-per-use pool had been empty; console.x.com was also IP-throttling the dashboard for days — unrelated to API usage).
+
+- **Bookmarks work on plain OAuth 1.0a** — the assumed OAuth 2.0 PKCE requirement is relaxed on pay-per-use (verified: `bookmarks` returned real data). Corrected the SKILL.md verified-state block + front-matter, which had claimed bookmarks need PKCE.
+- **DMs remain gated** — `403 oauth1-permissions`; fix is a console app-permission bump to "Read, Write, and Direct Messages" + regenerate the OAuth 1.0a access token (NOT PKCE). Parked as reminder `af04e1`.
+- **X MCP (`api.x.com/mcp` / `xdevplatform/xmcp`) assessed** — borrow-don't-replace: 200+ endpoints incl. writes, OAuth2-PKCE auto-refresh, but rides the SAME pay-per-use credit pool + dev app + rate limits, so it's an interface swap, not a cost/capability leap. Keep the on-demand CLI (zero standing MCP-memory cost, per-call `$` instrumentation). Verdict block added to SKILL.md.
+
 ## v2.4.0 (2026-03-04)
 
 ### Fixed — Bearer Token 403 on Pay Per Use Accounts

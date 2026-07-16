@@ -60,8 +60,11 @@ Paginate with `next_token` from response `meta.next_token`.
 | `url:` | `url:github.com` | Links to domain |
 | `conversation_id:` | `conversation_id:123` | Thread by root tweet ID |
 | `place_country:` | `place_country:US` | Country filter |
+| `min_likes:` | `min_likes:10` | Min likes (native, added 2026-05-04) |
+| `min_replies:` | `min_replies:5` | Min replies (native, added 2026-05-04) |
+| `min_reposts:` | `min_reposts:5` | Min reposts (native, added 2026-05-04) |
 
-**Not available as search operators:** `min_likes`, `min_retweets`, `min_replies`. Filter engagement post-hoc from `public_metrics`.
+**Engagement operators (`min_likes:` / `min_replies:` / `min_reposts:`) became native with the 2026-05-04 search index migration** — filter server-side rather than post-hoc. There is no native operator for impressions; filter that one post-hoc from `public_metrics`. The same migration **excludes retweets from keyword search results** (an explicit `-is:retweet` is now largely redundant on recent search).
 
 **Limits:** Max query length 512 chars for recent search, 1,024 for full-archive (4,096 for Enterprise).
 
@@ -114,16 +117,23 @@ With pay-per-use pricing (Feb 2026+), rate limits are primarily controlled by sp
 
 The skill uses a 350ms delay between requests as a safety buffer.
 
-### Cost (Pay-Per-Use — Updated Feb 2026)
+### Cost (Pay-Per-Use — Updated Apr 2026, verified 2026-07-16)
 
 X API uses **pay-per-use pricing** with prepaid credits. No subscriptions, no monthly caps.
 
-**Per-resource costs:**
+**Per-resource costs (Apr 16, 2026 pricing update):**
 | Resource | Cost |
 |----------|------|
+| Post create | $0.015 |
+| **Post containing a URL** | **$0.20** (⚠️ 13x) |
+| Summoned reply | $0.010 |
 | Post read | $0.005 |
+| Owned read | $0.001 |
 | User lookup | $0.010 |
-| Post create | $0.010 |
+| DM create | $0.015 |
+| DM event read | $0.010 |
+
+⚠️ **A post that contains a URL costs $0.20 — 13x the $0.015 base.** Isolate links to a single self-reply so only one post in a thread pays the penalty (and the hook keeps both its low cost and its reach).
 
 A typical research session: 5 queries × 100 tweets = 500 post reads = ~$2.50.
 
@@ -194,34 +204,43 @@ DELETE https://api.x.com/2/users/{user_id}/following/{target_user_id}
 
 Requires looking up the target user ID first via `GET /2/users/by/username/{username}`.
 
-## Media Upload (v1.1)
+## Media Upload (v2)
 
-Uses the v1.1 upload endpoint (not v2). OAuth 1.0a required.
+Uses the **v2 `POST /2/media/upload`** endpoint. OAuth 1.0a required. The legacy v1.1
+`upload.twitter.com/1.1/media/upload.json` endpoint was **sunset 2025-06-09**.
 
+**Simple (single-request) — images and small GIFs:**
 ```
-POST https://upload.twitter.com/1.1/media/upload.json
-Content-Type: application/x-www-form-urlencoded
+POST https://api.x.com/2/media/upload
+Content-Type: multipart/form-data
 
-media_data=<base64-encoded-file>&media_category=tweet_image
+media=<binary file>
+media_category=tweet_image   (or tweet_gif)
 ```
 
-**Supported types:** JPEG, PNG, GIF (non-animated and animated), WebP
-**Max size:** 5MB for images (video requires chunked upload, not implemented)
+**Chunked — video (and any large file), passing `command` as a multipart field:**
+```
+INIT      command=INIT  media_type=video/mp4  total_bytes=<n>  media_category=tweet_video
+APPEND    command=APPEND  media_id=<id>  segment_index=<i>  media=<chunk>   (repeat, 4MB chunks)
+FINALIZE  command=FINALIZE  media_id=<id>
+STATUS    GET ?command=STATUS&media_id=<id>   (poll processing_info.state until succeeded/failed)
+```
 
-**Response:**
+**Supported types:** images JPEG/PNG/GIF/WebP (max 5MB, 15MB GIF), video MP4/MOV (max 512MB, chunked).
+
+**Response** (both paths — the media id is in `data.id`):
 ```json
 {
-  "media_id": 710511363345354753,
-  "media_id_string": "710511363345354753",
-  "size": 11065,
-  "expires_after_secs": 86400,
-  "image": {
-    "image_type": "image/jpeg",
-    "w": 800,
-    "h": 418
+  "data": {
+    "id": "710511363345354753",
+    "media_key": "...",
+    "expires_after_secs": 86400,
+    "processing_info": { "state": "succeeded" }
   }
 }
 ```
+
+The code falls back to a legacy top-level `media_id_string` if present.
 
 **Attaching to tweets:** Include `media_id_string` in the tweet creation body:
 ```json
@@ -261,6 +280,38 @@ body: {"tweet_id": "..."}
 ```
 DELETE https://api.x.com/2/users/{user_id}/bookmarks/{tweet_id}
 ```
+
+## Articles (long-form)
+
+Launched **2026-06-11**. Authoring requires an X **Premium** account. No edit/delete endpoints yet.
+
+### Create Draft
+
+```
+POST https://api.x.com/2/articles/draft
+body: { "title": "...", "content_state": { "blocks": [...], "entityMap": {...} } }
+```
+
+`content_state` is a DraftJS content state. Block `type` values used by the CLI's builder:
+`unstyled` (paragraph), `header-one` / `header-two` / `header-three`, `unordered-list-item`.
+Inline links are DraftJS entities (`entityRanges` on the block referencing `entityMap` keys).
+Response carries the new article id in `data.id`.
+
+### Publish
+
+```
+POST https://api.x.com/2/articles/{article_id}/publish
+(no body)
+```
+
+⚠️ The exact `content_state` shape for links (keyed `entityMap` vs an `entities` array) is
+verified against docs but not yet by a live round trip — see the SKILL.md smoke-test checklist.
+
+## Reply-Summon Restriction (2026-02-23)
+
+Programmatic replies via `POST /2/tweets` to **another account's** post require the original
+author to have summoned the replier (by @mentioning it or quoting one of its posts). Self-reply
+chains (a thread on your own posts) are believed exempt but unverified.
 
 ## Direct Messages
 

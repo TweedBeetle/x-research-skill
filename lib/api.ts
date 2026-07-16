@@ -22,12 +22,21 @@
  *   3. Update SKILL.md auth section and CHANGELOG.md
  */
 
-import { readFileSync, statSync } from "fs";
+import { readFileSync, writeFileSync, existsSync } from "fs";
 import { createHmac, randomBytes } from "crypto";
 import { basename, extname } from "path";
 
 const BASE = "https://api.x.com/2";
 const RATE_DELAY_MS = 350; // stay under 450 req/15min
+
+// Retry/backoff (added 2026-07-16). 429s honor the reset header; transient 5xx
+// get bounded exponential backoff. Content-creating POSTs opt OUT of 5xx retry
+// (a lost-response 5xx could double-post) — 429 is still retried for them since
+// a 429 means the request was never processed. Reads/deletes/engagement (idempotent)
+// retry both. Thread-level double-posting is guarded separately by postThread's resume state.
+const MAX_RETRIES = 3;
+const BASE_BACKOFF_MS = 1000;
+const MAX_RETRY_WAIT_MS = 15 * 60_000; // never sleep longer than one 15-min window
 
 function readEnvFile(): Record<string, string> {
   const vars: Record<string, string> = {};
@@ -145,6 +154,54 @@ async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * fetch() with rate-limit and transient-error handling.
+ * - 429: waits for x-rate-limit-reset (epoch secs) or Retry-After (secs), then retries.
+ * - 5xx: bounded exponential backoff with jitter, but only when retryOn5xx is set.
+ * The initFactory is called fresh per attempt so each retry gets a new OAuth nonce/timestamp.
+ * On exhausting retries the last Response is returned so the caller surfaces the real error body.
+ */
+async function fetchWithRetry(
+  url: string,
+  initFactory: () => RequestInit,
+  opts: { retryOn5xx?: boolean; label?: string } = {}
+): Promise<Response> {
+  const label = opts.label ? ` (${opts.label})` : "";
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, initFactory());
+    const isLast = attempt >= MAX_RETRIES;
+
+    if (res.status === 429 && !isLast) {
+      const reset = res.headers.get("x-rate-limit-reset");
+      const retryAfter = res.headers.get("retry-after");
+      let waitMs: number;
+      if (reset) waitMs = parseInt(reset) * 1000 - Date.now();
+      else if (retryAfter) waitMs = parseInt(retryAfter) * 1000;
+      else waitMs = BASE_BACKOFF_MS * 2 ** attempt;
+      waitMs = Math.min(Math.max(waitMs, 1000), MAX_RETRY_WAIT_MS);
+      console.error(
+        `[x-api] 429 rate-limited${label}; waiting ${Math.round(waitMs / 1000)}s then retrying (${attempt + 1}/${MAX_RETRIES})`
+      );
+      await sleep(waitMs);
+      continue;
+    }
+
+    if (res.status >= 500 && opts.retryOn5xx && !isLast) {
+      const waitMs = Math.min(
+        BASE_BACKOFF_MS * 2 ** attempt + Math.floor(Math.random() * 250),
+        MAX_RETRY_WAIT_MS
+      );
+      console.error(
+        `[x-api] ${res.status} server error${label}; retrying in ${Math.round(waitMs / 1000)}s (${attempt + 1}/${MAX_RETRIES})`
+      );
+      await sleep(waitMs);
+      continue;
+    }
+
+    return res;
+  }
+}
+
 export interface Tweet {
   id: string;
   text: string;
@@ -252,20 +309,15 @@ function parseSince(since: string): string | null {
 }
 
 async function apiGet(url: string): Promise<RawResponse> {
-  // Use OAuth 1.0a for all reads (bearer token broken on Pay Per Use accounts)
+  // Use OAuth 1.0a for all reads (bearer token broken on Pay Per Use accounts).
+  // Reads are idempotent, so 5xx retries are safe. 429s are honored via the reset header.
   const creds = getOAuthCreds();
-  const authHeader = buildOAuthHeader("GET", url.split("?")[0], creds, url);
-  const res = await fetch(url, {
-    headers: { Authorization: authHeader },
-  });
-
-  if (res.status === 429) {
-    const reset = res.headers.get("x-rate-limit-reset");
-    const waitSec = reset
-      ? Math.max(parseInt(reset) - Math.floor(Date.now() / 1000), 1)
-      : 60;
-    throw new Error(`Rate limited. Resets in ${waitSec}s`);
-  }
+  const baseUrl = url.split("?")[0];
+  const res = await fetchWithRetry(
+    url,
+    () => ({ headers: { Authorization: buildOAuthHeader("GET", baseUrl, creds, url) } }),
+    { retryOn5xx: true, label: "GET" }
+  );
 
   if (!res.ok) {
     const body = await res.text();
@@ -450,19 +502,25 @@ export interface PostResult {
 
 async function apiPostOAuth(
   url: string,
-  body: Record<string, any>
+  body: Record<string, any>,
+  opts: { retryOn5xx?: boolean } = {}
 ): Promise<any> {
+  // Default: do NOT retry 5xx for content-creating POSTs (a lost-response 5xx after a
+  // successful write would double-post). Callers that are idempotent (like/repost/bookmark/
+  // follow) opt in with retryOn5xx. 429 is always retried (request never processed).
   const creds = getOAuthCreds();
-  const authHeader = buildOAuthHeader("POST", url, creds);
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: authHeader,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  const res = await fetchWithRetry(
+    url,
+    () => ({
+      method: "POST",
+      headers: {
+        Authorization: buildOAuthHeader("POST", url, creds),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    }),
+    { retryOn5xx: opts.retryOn5xx ?? false, label: "POST" }
+  );
 
   if (!res.ok) {
     const text = await res.text();
@@ -473,13 +531,13 @@ async function apiPostOAuth(
 }
 
 async function apiDeleteOAuth(url: string): Promise<any> {
+  // Deletes are idempotent, so retrying transient 5xx is safe.
   const creds = getOAuthCreds();
-  const authHeader = buildOAuthHeader("DELETE", url, creds);
-
-  const res = await fetch(url, {
-    method: "DELETE",
-    headers: { Authorization: authHeader },
-  });
+  const res = await fetchWithRetry(
+    url,
+    () => ({ method: "DELETE", headers: { Authorization: buildOAuthHeader("DELETE", url, creds) } }),
+    { retryOn5xx: true, label: "DELETE" }
+  );
 
   if (!res.ok) {
     const text = await res.text();
@@ -583,10 +641,12 @@ let _cachedUserId: string | null = null;
 
 async function apiGetOAuth(url: string): Promise<any> {
   const creds = getOAuthCreds();
-  const authHeader = buildOAuthHeader("GET", url, creds);
-  const res = await fetch(url, {
-    headers: { Authorization: authHeader },
-  });
+  const baseUrl = url.split("?")[0];
+  const res = await fetchWithRetry(
+    url,
+    () => ({ headers: { Authorization: buildOAuthHeader("GET", baseUrl, creds, url) } }),
+    { retryOn5xx: true, label: "GET" }
+  );
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`X API ${res.status}: ${text.slice(0, 300)}`);
@@ -614,25 +674,69 @@ async function getAuthenticatedUserId(): Promise<string> {
 
 // --- Thread posting ---
 
+export interface ThreadPostState {
+  posted: { index: number; id: string; url: string }[];
+}
+
 /**
- * Post a multi-tweet thread. First tweet is posted normally,
- * subsequent tweets are chained as replies.
+ * Post a multi-tweet thread. The first tweet is posted normally; each subsequent
+ * tweet chains as a reply to the previous one.
+ *
+ * Resumable: pass a stateFile path and each posted tweet's id is persisted as it lands.
+ * If a mid-chain post fails, re-running with the same stateFile skips the already-posted
+ * tweets and resumes the chain from the last posted id — so a retry never double-posts.
  * Optionally attach media to the first tweet via firstMediaIds.
  */
 export async function postThread(
   tweets: string[],
-  opts?: { firstMediaIds?: string[] }
+  opts?: {
+    firstMediaIds?: string[];
+    stateFile?: string;
+    onProgress?: (r: PostResult, index: number) => void;
+  }
 ): Promise<PostResult[]> {
   if (tweets.length === 0) throw new Error("No tweets to post");
 
-  const results: PostResult[] = [];
-  const first = await createTweet(tweets[0], { mediaIds: opts?.firstMediaIds });
-  results.push(first);
+  // Resume from prior progress if a state file exists.
+  let posted: ThreadPostState["posted"] = [];
+  if (opts?.stateFile && existsSync(opts.stateFile)) {
+    try {
+      const state: ThreadPostState = JSON.parse(readFileSync(opts.stateFile, "utf-8"));
+      posted = Array.isArray(state.posted) ? state.posted : [];
+    } catch {
+      posted = [];
+    }
+  }
 
-  for (let i = 1; i < tweets.length; i++) {
-    await sleep(1000); // delay between posts to avoid rate issues
-    const reply = await replyToTweet(tweets[i], results[i - 1].id);
-    results.push(reply);
+  const persist = () => {
+    if (opts?.stateFile) {
+      writeFileSync(opts.stateFile, JSON.stringify({ posted }, null, 2));
+    }
+  };
+
+  // Reconstruct results for already-posted tweets (so callers see the full chain).
+  const results: PostResult[] = posted.map((p) => ({
+    id: p.id,
+    text: tweets[p.index] ?? "",
+    tweet_url: p.url,
+  }));
+
+  const startIndex = posted.length;
+  let parentId = posted.length > 0 ? posted[posted.length - 1].id : undefined;
+
+  for (let i = startIndex; i < tweets.length; i++) {
+    let r: PostResult;
+    if (i === 0 && parentId === undefined) {
+      r = await createTweet(tweets[0], { mediaIds: opts?.firstMediaIds });
+    } else {
+      await sleep(1000); // delay between posts to avoid rate issues
+      r = await replyToTweet(tweets[i], parentId!);
+    }
+    results.push(r);
+    posted.push({ index: i, id: r.id, url: r.tweet_url });
+    persist();
+    parentId = r.id;
+    opts?.onProgress?.(r, i);
   }
 
   return results;
@@ -646,7 +750,7 @@ export async function postThread(
 export async function likeTweet(tweetId: string): Promise<void> {
   const userId = await getAuthenticatedUserId();
   const url = `${BASE}/users/${userId}/likes`;
-  await apiPostOAuth(url, { tweet_id: tweetId });
+  await apiPostOAuth(url, { tweet_id: tweetId }, { retryOn5xx: true });
 }
 
 /**
@@ -664,7 +768,7 @@ export async function unlikeTweet(tweetId: string): Promise<void> {
 export async function repostTweet(tweetId: string): Promise<void> {
   const userId = await getAuthenticatedUserId();
   const url = `${BASE}/users/${userId}/retweets`;
-  await apiPostOAuth(url, { tweet_id: tweetId });
+  await apiPostOAuth(url, { tweet_id: tweetId }, { retryOn5xx: true });
 }
 
 /**
@@ -693,7 +797,7 @@ export async function followUser(username: string): Promise<void> {
   const userId = await getAuthenticatedUserId();
   const targetId = await getUserId(username);
   const url = `${BASE}/users/${userId}/following`;
-  await apiPostOAuth(url, { target_user_id: targetId });
+  await apiPostOAuth(url, { target_user_id: targetId }, { retryOn5xx: true });
 }
 
 /**
@@ -706,11 +810,17 @@ export async function unfollowUser(username: string): Promise<void> {
   await apiDeleteOAuth(url);
 }
 
-// --- Media upload (v1.1 endpoint, OAuth 1.0a) ---
+// --- Media upload (v2 /2/media/upload, OAuth 1.0a) ---
+//
+// Migrated 2026-07-16 from the sunset v1.1 endpoint. The legacy
+// upload.twitter.com/1.1/media/upload.json was sunset 2025-06-09; all uploads now go
+// through POST https://api.x.com/2/media/upload. Images (and small GIFs) use the simple
+// single-request path; video (and any file larger than one chunk) uses the chunked
+// INIT/APPEND/FINALIZE/STATUS flow, which unlocks video posting.
 
-const UPLOAD_BASE = "https://upload.twitter.com/1.1";
+const V2_MEDIA_UPLOAD = "https://api.x.com/2/media/upload";
 
-const ALLOWED_MEDIA_TYPES: Record<string, string> = {
+const IMAGE_MEDIA_TYPES: Record<string, string> = {
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
   ".png": "image/png",
@@ -718,7 +828,15 @@ const ALLOWED_MEDIA_TYPES: Record<string, string> = {
   ".webp": "image/webp",
 };
 
-const MAX_MEDIA_SIZE = 5 * 1024 * 1024; // 5MB
+const VIDEO_MEDIA_TYPES: Record<string, string> = {
+  ".mp4": "video/mp4",
+  ".mov": "video/quicktime",
+};
+
+const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB images / webp
+const MAX_GIF_SIZE = 15 * 1024 * 1024; // 15MB GIF
+const MAX_VIDEO_SIZE = 512 * 1024 * 1024; // 512MB video
+const UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB per APPEND segment (under the 5MB per-chunk limit)
 
 export interface MediaUploadResult {
   media_id_string: string;
@@ -726,63 +844,262 @@ export interface MediaUploadResult {
   size: number;
 }
 
+function mediaCategoryFor(mimeType: string): string {
+  if (mimeType.startsWith("video/")) return "tweet_video";
+  if (mimeType === "image/gif") return "tweet_gif";
+  return "tweet_image";
+}
+
+/** Pull the media id out of a v2 upload response (data.id in v2; media_id_string on the legacy shape). */
+function extractMediaId(result: any): string {
+  const id =
+    result?.data?.id ||
+    result?.media_id_string ||
+    (result?.media_id != null ? String(result.media_id) : undefined);
+  if (!id) {
+    throw new Error(`Media upload: no media id in response: ${JSON.stringify(result).slice(0, 200)}`);
+  }
+  return String(id);
+}
+
+async function postMediaForm(form: FormData, label: string): Promise<any> {
+  const creds = getOAuthCreds();
+  // multipart body params are excluded from the OAuth 1.0a signature (RFC 5849),
+  // so the header only needs oauth_* params; fetch sets the multipart boundary from FormData.
+  const res = await fetchWithRetry(
+    V2_MEDIA_UPLOAD,
+    () => ({ method: "POST", headers: { Authorization: buildOAuthHeader("POST", V2_MEDIA_UPLOAD, creds) }, body: form }),
+    { retryOn5xx: false, label }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Media upload ${label} ${res.status}: ${text.slice(0, 300)}`);
+  }
+  return res.json();
+}
+
 /**
- * Upload an image file for use in tweets.
- * Supports JPEG, PNG, GIF, WebP. Max 5MB.
- * Uses v1.1 media upload endpoint with base64 encoding.
+ * Upload a media file for use in tweets.
+ * Images/small GIFs: JPEG, PNG, GIF, WebP (max 5MB image, 15MB GIF) via the simple path.
+ * Video: MP4, MOV (max 512MB) via the chunked path (also used for any file over one chunk).
+ * v2 endpoint POST https://api.x.com/2/media/upload (OAuth 1.0a).
  */
 export async function uploadMedia(filePath: string): Promise<MediaUploadResult> {
   const ext = extname(filePath).toLowerCase();
-  const mimeType = ALLOWED_MEDIA_TYPES[ext];
+  const imageType = IMAGE_MEDIA_TYPES[ext];
+  const videoType = VIDEO_MEDIA_TYPES[ext];
+  const mimeType = imageType || videoType;
   if (!mimeType) {
     throw new Error(
-      `Unsupported file type: ${ext}. Supported: ${Object.keys(ALLOWED_MEDIA_TYPES).join(", ")}`
+      `Unsupported file type: ${ext}. Supported: ${[...Object.keys(IMAGE_MEDIA_TYPES), ...Object.keys(VIDEO_MEDIA_TYPES)].join(", ")}`
     );
   }
 
   const fileData = readFileSync(filePath);
-  if (fileData.length > MAX_MEDIA_SIZE) {
+  const category = mediaCategoryFor(mimeType);
+
+  const maxSize = videoType ? MAX_VIDEO_SIZE : mimeType === "image/gif" ? MAX_GIF_SIZE : MAX_IMAGE_SIZE;
+  if (fileData.length > maxSize) {
     throw new Error(
-      `File too large: ${(fileData.length / 1024 / 1024).toFixed(1)}MB (max 5MB)`
+      `File too large: ${(fileData.length / 1024 / 1024).toFixed(1)}MB (max ${(maxSize / 1024 / 1024).toFixed(0)}MB for ${category})`
     );
   }
 
-  const base64Data = fileData.toString("base64");
-  const url = `${UPLOAD_BASE}/media/upload.json`;
+  // Video (and anything larger than a single chunk) → chunked; images → simple.
+  const useChunked = !!videoType || fileData.length > UPLOAD_CHUNK_SIZE;
+  const mediaId = useChunked
+    ? await uploadMediaChunked(fileData, mimeType, category)
+    : await uploadMediaSimple(fileData, mimeType, category);
 
-  const creds = getOAuthCreds();
-  const authHeader = buildOAuthHeader("POST", url, creds);
+  return { media_id_string: mediaId, media_type: mimeType, size: fileData.length };
+}
 
-  // Use multipart/form-data for v1.1 media upload.
-  // Per Twitter docs and RFC 5849: multipart body params are excluded from
-  // OAuth signature base string, so buildOAuthHeader needs only oauth_* params.
-  const boundary = `----NodeFormBoundary${randomBytes(16).toString("hex")}`;
-  const parts = [
-    `--${boundary}\r\nContent-Disposition: form-data; name="media_data"\r\n\r\n${base64Data}\r\n`,
-    `--${boundary}\r\nContent-Disposition: form-data; name="media_category"\r\n\r\ntweet_image\r\n`,
-    `--${boundary}--\r\n`,
-  ];
-  const multipartBody = parts.join("");
+async function uploadMediaSimple(fileData: Buffer, mimeType: string, category: string): Promise<string> {
+  const form = new FormData();
+  form.append("media", new Blob([new Uint8Array(fileData)], { type: mimeType }), "media");
+  form.append("media_category", category);
+  return extractMediaId(await postMediaForm(form, "media/upload (simple)"));
+}
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: authHeader,
-      "Content-Type": `multipart/form-data; boundary=${boundary}`,
-    },
-    body: multipartBody,
-  });
+async function uploadMediaChunked(fileData: Buffer, mimeType: string, category: string): Promise<string> {
+  // INIT
+  const initForm = new FormData();
+  initForm.append("command", "INIT");
+  initForm.append("media_type", mimeType);
+  initForm.append("total_bytes", String(fileData.length));
+  initForm.append("media_category", category);
+  const mediaId = extractMediaId(await postMediaForm(initForm, "media/upload INIT"));
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Media upload ${res.status}: ${text.slice(0, 300)}`);
+  // APPEND — 4MB segments
+  let segmentIndex = 0;
+  for (let offset = 0; offset < fileData.length; offset += UPLOAD_CHUNK_SIZE) {
+    const chunk = fileData.subarray(offset, Math.min(offset + UPLOAD_CHUNK_SIZE, fileData.length));
+    const appendForm = new FormData();
+    appendForm.append("command", "APPEND");
+    appendForm.append("media_id", mediaId);
+    appendForm.append("segment_index", String(segmentIndex));
+    appendForm.append("media", new Blob([new Uint8Array(chunk)], { type: "application/octet-stream" }), "blob");
+    await postMediaForm(appendForm, `media/upload APPEND ${segmentIndex}`);
+    segmentIndex++;
   }
 
-  const result = await res.json();
+  // FINALIZE
+  const finalizeForm = new FormData();
+  finalizeForm.append("command", "FINALIZE");
+  finalizeForm.append("media_id", mediaId);
+  const finalizeRes = await postMediaForm(finalizeForm, "media/upload FINALIZE");
+
+  // Video is processed asynchronously — poll STATUS until succeeded/failed.
+  await waitForMediaProcessing(mediaId, finalizeRes);
+  return mediaId;
+}
+
+async function waitForMediaProcessing(mediaId: string, lastResponse: any): Promise<void> {
+  let info = lastResponse?.data?.processing_info || lastResponse?.processing_info;
+  while (info && (info.state === "pending" || info.state === "in_progress")) {
+    const waitSec = info.check_after_secs || 2;
+    await sleep(waitSec * 1000);
+    const status = await apiGetOAuth(`${V2_MEDIA_UPLOAD}?command=STATUS&media_id=${mediaId}`);
+    info = status?.data?.processing_info || status?.processing_info;
+    if (info?.state === "failed") {
+      throw new Error(`Media processing failed: ${JSON.stringify(info.error || info).slice(0, 200)}`);
+    }
+  }
+}
+
+// --- Articles (long-form, v2, OAuth 1.0a) ---
+//
+// Launched 2026-06-11. Two endpoints: POST /2/articles/draft creates a draft, then
+// POST /2/articles/{article_id}/publish publishes it. The draft body is a DraftJS
+// content state. Authoring Articles requires an X Premium account. There are no edit
+// or delete endpoints yet — a draft can only be created and (once) published.
+
+export interface DraftJSBlock {
+  key: string;
+  text: string;
+  type: string;
+  depth: number;
+  inlineStyleRanges: any[];
+  entityRanges: { offset: number; length: number; key: number }[];
+  data?: Record<string, any>;
+}
+
+export interface DraftJSContentState {
+  blocks: DraftJSBlock[];
+  // Standard DraftJS raw shape (what convertToRaw emits). The X docs render the empty
+  // case as "entities": [] — if a live round trip shows X expects an array here instead
+  // of the keyed entityMap, that is the one field to change (see the smoke-test checklist).
+  entityMap: Record<string, { type: string; mutability: string; data: Record<string, any> }>;
+}
+
+export interface ArticleResult {
+  id: string;
+  title: string;
+  url?: string;
+}
+
+let _blockKeyCounter = 0;
+function nextBlockKey(): string {
+  return (++_blockKeyCounter).toString(36).padStart(5, "0");
+}
+
+/**
+ * Convert a lightweight markdown-ish string into a DraftJS content state.
+ * Supported: blank-line-separated paragraphs; ATX headers (#, ##, ###); "- " / "* "
+ * unordered list items; inline links [text](url). Intentionally simple — not a full
+ * markdown parser. Link display text always survives as plain text, so even if the
+ * entity map is ignored the article body is never lost.
+ */
+export function buildArticleContentState(markdown: string): DraftJSContentState {
+  const blocks: DraftJSBlock[] = [];
+  const entityMap: DraftJSContentState["entityMap"] = {};
+  let entityKey = 0;
+
+  const pushBlock = (type: string, text: string) => {
+    // Extract inline [text](url) links → plain display text + DraftJS entity ranges.
+    const entityRanges: DraftJSBlock["entityRanges"] = [];
+    const linkRe = /\[([^\]]+)\]\(([^)]+)\)/g;
+    let out = "";
+    let lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = linkRe.exec(text)) !== null) {
+      out += text.slice(lastIndex, m.index);
+      const offset = out.length;
+      out += m[1];
+      entityMap[String(entityKey)] = { type: "LINK", mutability: "MUTABLE", data: { url: m[2], href: m[2] } };
+      entityRanges.push({ offset, length: m[1].length, key: entityKey });
+      entityKey++;
+      lastIndex = linkRe.lastIndex;
+    }
+    out += text.slice(lastIndex);
+    blocks.push({ key: nextBlockKey(), text: out, type, depth: 0, inlineStyleRanges: [], entityRanges });
+  };
+
+  let paragraphBuffer: string[] = [];
+  const flushParagraph = () => {
+    if (paragraphBuffer.length === 0) return;
+    pushBlock("unstyled", paragraphBuffer.join(" "));
+    paragraphBuffer = [];
+  };
+
+  for (const line of markdown.replace(/\r\n/g, "\n").split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "") {
+      flushParagraph();
+      continue;
+    }
+    const header = trimmed.match(/^(#{1,3})\s+(.*)$/);
+    if (header) {
+      flushParagraph();
+      const level = header[1].length;
+      const type = level === 1 ? "header-one" : level === 2 ? "header-two" : "header-three";
+      pushBlock(type, header[2]);
+      continue;
+    }
+    const listItem = trimmed.match(/^[-*]\s+(.*)$/);
+    if (listItem) {
+      flushParagraph();
+      pushBlock("unordered-list-item", listItem[1]);
+      continue;
+    }
+    paragraphBuffer.push(trimmed);
+  }
+  flushParagraph();
+
+  if (blocks.length === 0) {
+    // DraftJS requires at least one block.
+    blocks.push({ key: nextBlockKey(), text: "", type: "unstyled", depth: 0, inlineStyleRanges: [], entityRanges: [] });
+  }
+
+  return { blocks, entityMap };
+}
+
+/**
+ * Create an Article draft. Returns the article id (needed to publish).
+ * `body` is markdown-ish text run through buildArticleContentState; pass a prebuilt
+ * content state via opts.contentState to bypass the builder. Requires X Premium.
+ */
+export async function draftArticle(
+  title: string,
+  body: string,
+  opts?: { contentState?: DraftJSContentState }
+): Promise<ArticleResult> {
+  const content_state = opts?.contentState || buildArticleContentState(body);
+  const result = await apiPostOAuth(`${BASE}/articles/draft`, { title, content_state });
+  const id = result.data?.id;
+  if (!id) {
+    throw new Error(`Article draft: no id in response: ${JSON.stringify(result).slice(0, 200)}`);
+  }
+  return { id: String(id), title, url: result.data?.url };
+}
+
+/** Publish a previously-drafted Article by id. No edit/delete endpoint exists post-publish. */
+export async function publishArticle(articleId: string): Promise<ArticleResult> {
+  const result = await apiPostOAuth(`${BASE}/articles/${articleId}/publish`, {});
   return {
-    media_id_string: result.media_id_string,
-    media_type: mimeType,
-    size: fileData.length,
+    id: String(result.data?.id || articleId),
+    title: result.data?.title || "",
+    url: result.data?.url,
   };
 }
 
@@ -810,7 +1127,7 @@ export async function listBookmarks(
 export async function bookmarkTweet(tweetId: string): Promise<void> {
   const userId = await getAuthenticatedUserId();
   const url = `${BASE}/users/${userId}/bookmarks`;
-  await apiPostOAuth(url, { tweet_id: tweetId });
+  await apiPostOAuth(url, { tweet_id: tweetId }, { retryOn5xx: true });
 }
 
 /**
