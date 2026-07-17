@@ -160,14 +160,14 @@ bun run x.ts article-publish <article_id>
 
 Create and publish X Articles (long-form, rich-text posts) via the API. Launched **2026-06-11**. Authoring Articles **requires an X Premium account**. There are **no edit or delete endpoints yet** — a draft can only be created and then published once.
 
-`article-draft` takes a markdown-ish body (from `--file` or inline args) and builds a DraftJS content state. Supported markup is intentionally simple: blank-line-separated paragraphs, ATX headers (`#`, `##`, `###`), `-`/`*` unordered list items, and inline `[text](url)` links. It prints the returned `article_id`. Pass `--publish` to draft then publish in one step, or run `article-publish <id>` later.
+`article-draft` takes a markdown-ish body (from `--file` or inline args) and builds X's article content state. Supported markup is intentionally simple: blank-line-separated paragraphs, ATX headers (`#`, `##`, `###`), `-`/`*` unordered list items, and inline `[text](url)` links. It prints the returned `article_id`. Pass `--publish` to draft then publish in one step, or run `article-publish <id>` later.
 
-- `POST /2/articles/draft` body: `{ "title": ..., "content_state": { "blocks": [...], "entityMap": {...} } }`
+- `POST /2/articles/draft` body: `{ "title": ..., "content_state": { "blocks": [...], "entities": [...] } }`
 - `POST /2/articles/{article_id}/publish` — no body.
 
-This makes the **Article + summary-thread hybrid** (write the Article, post a summarized thread as the distribution engine, link the Article at the end) fully automatable end to end. See the x-posting skill.
+⚠️ **X's content_state is DraftJS-flavored, NOT standard raw DraftJS** (verified live 2026-07-17 by iterative probing; the schema rejects unknown properties): blocks carry ONLY `text` + `type` (+ optional snake_case `entity_ranges`) — standard `convertToRaw` blocks with `key`/`depth`/`inlineStyleRanges` 400. Entities are a top-level ARRAY of `{key: "<string>", value: {type, mutability, data}}` pairs (not a keyed `entityMap`), with lowercase enums: `type` ∈ post|link|image|emoji|markdown|divider|latex, `mutability` ∈ immutable|mutable|segmented. A link is `{key: "0", value: {type: "link", mutability: "mutable", data: {url}}}` + `entity_ranges: [{offset, length, key: 0}]` on the block. `buildArticleContentState` emits exactly this shape.
 
-⚠️ **Needs a live round trip to confirm** — the DraftJS body shape (especially whether X wants `entityMap` vs an `entities` array for links) and the Premium gate were verified against docs, not by an actual draft+publish. See the smoke-test checklist at the end. The link display text always survives as plain text, so a shape mismatch degrades links to plain text rather than dropping content.
+This makes the **Article + summary-thread hybrid** (write the Article, post a summarized thread as the distribution engine, link the Article at the end) automatable end to end. See the x-posting skill. Draft creation incl. headers/lists/links is live-verified; the publish step and how link entities RENDER in a published article are not yet (no delete endpoint exists, so a test publish would sit on the profile permanently — verify on the first real Article).
 
 ### Like / Unlike
 
@@ -198,10 +198,10 @@ bun run x.ts unfollow <username>
 bun run x.ts upload <filepath>
 ```
 
-Uploads a media file and prints the `media_id_string` to stdout. Use this to pre-upload media, then pass the ID to tweet creation. Uses the **v2 `POST /2/media/upload`** endpoint (OAuth 1.0a).
+Uploads a media file and prints the `media_id_string` to stdout. Use this to pre-upload media, then pass the ID to tweet creation. Uses the **v2 media upload** endpoints (OAuth 1.0a); both paths verified live 2026-07-17.
 
-- **Images / small GIFs** (JPEG, PNG, GIF, WebP; max 5MB image, 15MB GIF) use the simple single-request path.
-- **Video** (MP4, MOV; max 512MB) uses the chunked `INIT`/`APPEND`/`FINALIZE`/`STATUS` flow and polls until X finishes async processing. This is what unlocks video posting.
+- **Images / small GIFs** (JPEG, PNG, GIF, WebP; max 5MB image, 15MB GIF) use the simple single-request path: multipart `media` + `media_category` on `POST /2/media/upload`.
+- **Video** (MP4, MOV; max 512MB) uses the chunked **subpath** flow and polls until X finishes async processing: `POST /2/media/upload/initialize` (JSON: `media_type`, `total_bytes`, `media_category`) → `POST /2/media/upload/{id}/append` (multipart: `media`, `segment_index`) → `POST /2/media/upload/{id}/finalize` (no body) → status via `GET /2/media/upload?media_id={id}`. ⚠️ The older command-based flow (`command=INIT/APPEND/FINALIZE` on the base endpoint) **400s** with "Missing media field in JSON" — the base endpoint only serves the simple path now, even though the docs.x.com chunked quickstart still shows the command flow (stale as of 2026-07-17).
 
 The v2 response carries the media id in `data.id` (the code also falls back to the legacy `media_id_string` shape). The old v1.1 `upload.twitter.com/1.1/media/upload.json` endpoint was **sunset 2025-06-09** and is no longer used.
 
@@ -293,7 +293,7 @@ The app needs **Read and Write** permissions (not just Read). Set under Apps -> 
 
 ## Platform behavior notes (2026) <!-- last-verified: 2026-07-16 -->
 
-**Reply-summon restriction (2026-02-23).** Programmatic replies via `POST /2/tweets` to **someone else's** post now require the original author to have "summoned" the replying account first, by @mentioning it or quoting one of its posts (docs.x.com/changelog, Feb 23 2026). ⚠️ **Self-reply chains are believed exempt** — when you reply to your own post (which is how `thread-post` builds a thread), you ARE the author, so the summon condition does not apply, and the audit + changelog wording both point that way. But this has **NOT been confirmed with a live post** — treat thread self-chaining as needs-live-verification (see the smoke-test checklist). If a self-reply chain ever 403s on the second tweet, this restriction is the first suspect. A **summoned** reply is also cheaper ($0.010 vs $0.015).
+**Reply-summon restriction (2026-02-23).** Programmatic replies via `POST /2/tweets` to **someone else's** post now require the original author to have "summoned" the replying account first, by @mentioning it or quoting one of its posts (docs.x.com/changelog, Feb 23 2026). **Self-reply chains are exempt — confirmed live 2026-07-17**: a 3-tweet `thread-post` chained cleanly with no 403 (you ARE the author, so the summon condition doesn't apply). A **summoned** reply is also cheaper ($0.010 vs $0.015).
 
 **Search modernization (2026-05-04).** The search endpoints migrated to a new index, which (a) added native precision operators `min_likes:`, `min_replies:`, `min_reposts:` (the CLI now emits these server-side for `--min-likes` / `--quality` / `--min-replies` / `--min-reposts` instead of filtering post-hoc — cheaper and more accurate), (b) **excludes retweets from keyword search results** (so the auto-added `-is:retweet` is now mostly a no-op on recent search, kept for `--archive`), and (c) is associated with the resolution of the long-standing intermittent `503`s. `--min-impressions` has no native operator and stays a post-hoc filter.
 
@@ -452,34 +452,31 @@ skills/x-api/
     └── x-api.md        (X API endpoint reference)
 ```
 
-## Live smoke-test checklist (pending, needs Christo's go-ahead — real posts, real cost) <!-- added: 2026-07-16 -->
+## Live smoke-test results (run 2026-07-17, Christo's go-ahead; ~$0.30 total) <!-- added: 2026-07-16, executed: 2026-07-17 -->
 
-The 2026-07-16 freshen-up verified every changed request shape against the live docs and by
-construction (TypeScript compiles under bun; the DraftJS builder is unit-checked; all no-cost CLI
-paths run). But the following need a **real API call that posts content and spends credits**, so
-they were deliberately left for a supervised live run. Do these only with Christo's explicit
-go-ahead, on the pay-per-use account with credits topped up. Ordered cheapest-risk first:
+All five items from the 2026-07-16 checklist were exercised live on the pay-per-use account.
+Two found real bugs, both fixed in the same session (see `lib/api.ts`):
 
-1. **Retry behavior (cheap, read-only).** Run a normal `search` / `tweet` read and confirm it still
-   returns 200. To exercise the 429 path without abuse, watch stderr for the `[x-api] 429
-   rate-limited … retrying` line under natural load. No content posted.
-2. **v2 media upload — image.** `upload <small.jpg>` → expect a `media_id_string` printed from the v2
-   `data.id`. Then `post "test" --media <small.jpg>` and confirm the image attaches. (~$0.015 + a
-   throwaway post to delete.)
-3. **v2 media upload — video (chunked).** `upload <short.mp4>` → confirm INIT/APPEND/FINALIZE succeed
-   and STATUS polls to `succeeded`, then a post attaches the video. This is the genuinely new
-   capability; the chunked flow and the simple-upload `media` field name are the highest-uncertainty
-   parts.
-4. **Thread self-chaining under the summon restriction.** Post a 2–3 tweet `thread-post`. Confirm the
-   second and third tweets chain as self-replies WITHOUT a 403. If the second tweet 403s, the
-   2026-02-23 reply-summon restriction is NOT exempt for self-replies and the thread strategy needs a
-   rethink. Also confirm the resume state file is written per tweet and removed on success (kill it
-   mid-way once and re-run to confirm it resumes rather than double-posts).
-5. **Articles draft + publish round trip (Premium account required).** `article-draft --title …
-   --file …` → confirm a draft id comes back and the DraftJS body is accepted. Then
-   `article-publish <id>` → confirm it publishes with the paragraphs/headers/links intact. **The one
-   field to watch:** whether X wants `content_state.entityMap` (what we send) or an `entities` array
-   for links. If links render as plain text but the body is otherwise correct, flip that field.
-
-Report results back into this file (dates + verified/failed) and drop the "believed / unverified"
-hedges on whatever passes.
+1. **Reads / retry plumbing — PASS.** `tweet 20` → 200. (No natural 429 occurred, so the
+   retry-on-429 branch itself remains exercised-by-code-review only.)
+2. **v2 image upload — PASS.** Simple path uploaded a PNG, attached it to a post, rendered;
+   test post deleted.
+3. **v2 chunked video upload — FAILED then FIXED.** The command-based flow (`command=INIT` on the
+   base endpoint) 400s with "Missing media field in JSON"; the live chunked flow uses the subpath
+   endpoints (`/initialize` JSON → `/{id}/append` multipart → `/{id}/finalize`, status via
+   `?media_id=`). Reimplemented; a real MP4 then uploaded, processed, attached, and rendered;
+   test post deleted. Note: the docs.x.com chunked quickstart still documents the OLD command flow
+   — trust the per-endpoint reference pages, not the quickstart.
+4. **Thread self-chaining + resume — PASS.** 3-tweet thread chained with no 403 (summon restriction
+   confirmed exempt for self-replies). A mid-chain kill left a correct per-tweet state file; the
+   re-run resumed, posted only the missing tweet, chained it into the same conversation, and removed
+   the state file. Minor known quirk: a resumed run's cost summary line counts the whole thread, not
+   just the tweets it actually posted. All test tweets deleted.
+5. **Articles draft — FAILED then FIXED; publish deliberately NOT run.** X rejects standard raw
+   DraftJS (schema disallows `key`/`depth`/`inlineStyleRanges`; entities are an array of
+   `{key: "<string>", value: {...}}` with lowercase enums — full shape in the Articles section).
+   Builder reimplemented; a draft with headers, a list, and an inline link is now accepted
+   (drafts 2078009328125034496 / 2078009705184595969 / 2078010024022990848 — never published).
+   The publish round trip was intentionally skipped: Articles have **no delete endpoint**, so a
+   test publish would sit on the real profile permanently. Remaining unverified: `article-publish`
+   itself + how link entities render in a published article — verify on the first real Article.

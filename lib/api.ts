@@ -862,13 +862,36 @@ function extractMediaId(result: any): string {
   return String(id);
 }
 
-async function postMediaForm(form: FormData, label: string): Promise<any> {
+async function postMediaForm(url: string, form: FormData, label: string): Promise<any> {
   const creds = getOAuthCreds();
   // multipart body params are excluded from the OAuth 1.0a signature (RFC 5849),
   // so the header only needs oauth_* params; fetch sets the multipart boundary from FormData.
   const res = await fetchWithRetry(
-    V2_MEDIA_UPLOAD,
-    () => ({ method: "POST", headers: { Authorization: buildOAuthHeader("POST", V2_MEDIA_UPLOAD, creds) }, body: form }),
+    url,
+    () => ({ method: "POST", headers: { Authorization: buildOAuthHeader("POST", url, creds) }, body: form }),
+    { retryOn5xx: false, label }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Media upload ${label} ${res.status}: ${text.slice(0, 300)}`);
+  }
+  return res.json();
+}
+
+// JSON (or body-less) POST for the chunked-upload subpath endpoints. JSON bodies, like
+// multipart ones, are excluded from the OAuth 1.0a signature.
+async function postMediaJson(url: string, body: any | undefined, label: string): Promise<any> {
+  const creds = getOAuthCreds();
+  const res = await fetchWithRetry(
+    url,
+    () => ({
+      method: "POST",
+      headers: {
+        Authorization: buildOAuthHeader("POST", url, creds),
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    }),
     { retryOn5xx: false, label }
   );
   if (!res.ok) {
@@ -918,38 +941,38 @@ async function uploadMediaSimple(fileData: Buffer, mimeType: string, category: s
   const form = new FormData();
   form.append("media", new Blob([new Uint8Array(fileData)], { type: mimeType }), "media");
   form.append("media_category", category);
-  return extractMediaId(await postMediaForm(form, "media/upload (simple)"));
+  return extractMediaId(await postMediaForm(V2_MEDIA_UPLOAD, form, "media/upload (simple)"));
 }
 
 async function uploadMediaChunked(fileData: Buffer, mimeType: string, category: string): Promise<string> {
-  // INIT
-  const initForm = new FormData();
-  initForm.append("command", "INIT");
-  initForm.append("media_type", mimeType);
-  initForm.append("total_bytes", String(fileData.length));
-  initForm.append("media_category", category);
-  const mediaId = extractMediaId(await postMediaForm(initForm, "media/upload INIT"));
+  // The chunked flow uses dedicated subpath endpoints. The older command-based multipart
+  // flow (command=INIT/APPEND/FINALIZE on the base endpoint) 400s with "Missing media
+  // field in JSON" — the base endpoint only serves the simple path now (verified live
+  // 2026-07-17; endpoint shapes per docs.x.com/x-api/media/media-upload-initialize etc.).
 
-  // APPEND — 4MB segments
+  // INITIALIZE — JSON body
+  const initRes = await postMediaJson(
+    `${V2_MEDIA_UPLOAD}/initialize`,
+    { media_type: mimeType, total_bytes: fileData.length, media_category: category },
+    "media/upload/initialize"
+  );
+  const mediaId = extractMediaId(initRes);
+
+  // APPEND — 4MB multipart segments on the per-id subpath
   let segmentIndex = 0;
   for (let offset = 0; offset < fileData.length; offset += UPLOAD_CHUNK_SIZE) {
     const chunk = fileData.subarray(offset, Math.min(offset + UPLOAD_CHUNK_SIZE, fileData.length));
     const appendForm = new FormData();
-    appendForm.append("command", "APPEND");
-    appendForm.append("media_id", mediaId);
     appendForm.append("segment_index", String(segmentIndex));
     appendForm.append("media", new Blob([new Uint8Array(chunk)], { type: "application/octet-stream" }), "blob");
-    await postMediaForm(appendForm, `media/upload APPEND ${segmentIndex}`);
+    await postMediaForm(`${V2_MEDIA_UPLOAD}/${mediaId}/append`, appendForm, `media/upload append ${segmentIndex}`);
     segmentIndex++;
   }
 
-  // FINALIZE
-  const finalizeForm = new FormData();
-  finalizeForm.append("command", "FINALIZE");
-  finalizeForm.append("media_id", mediaId);
-  const finalizeRes = await postMediaForm(finalizeForm, "media/upload FINALIZE");
+  // FINALIZE — body-less POST on the per-id subpath
+  const finalizeRes = await postMediaJson(`${V2_MEDIA_UPLOAD}/${mediaId}/finalize`, undefined, "media/upload finalize");
 
-  // Video is processed asynchronously — poll STATUS until succeeded/failed.
+  // Video is processed asynchronously — poll status until succeeded/failed.
   await waitForMediaProcessing(mediaId, finalizeRes);
   return mediaId;
 }
@@ -959,7 +982,7 @@ async function waitForMediaProcessing(mediaId: string, lastResponse: any): Promi
   while (info && (info.state === "pending" || info.state === "in_progress")) {
     const waitSec = info.check_after_secs || 2;
     await sleep(waitSec * 1000);
-    const status = await apiGetOAuth(`${V2_MEDIA_UPLOAD}?command=STATUS&media_id=${mediaId}`);
+    const status = await apiGetOAuth(`${V2_MEDIA_UPLOAD}?media_id=${mediaId}`);
     info = status?.data?.processing_info || status?.processing_info;
     if (info?.state === "failed") {
       throw new Error(`Media processing failed: ${JSON.stringify(info.error || info).slice(0, 200)}`);
@@ -974,33 +997,28 @@ async function waitForMediaProcessing(mediaId: string, lastResponse: any): Promi
 // content state. Authoring Articles requires an X Premium account. There are no edit
 // or delete endpoints yet — a draft can only be created and (once) published.
 
+// X's article content_state is DraftJS-flavored but NOT the standard convertToRaw shape.
+// Verified live 2026-07-17 by iterative probing (the schema rejects unknown properties):
+// - blocks carry ONLY text + type (+ optional snake_case entity_ranges); no key/depth/
+//   inlineStyleRanges — standard raw-DraftJS blocks 400.
+// - entities is a top-level ARRAY of {key: "<string>", value: {...}} pairs, not a keyed
+//   entityMap; value.type and value.mutability are lowercase enums
+//   (type: post|link|image|emoji|markdown|divider|latex; mutability: immutable|mutable|segmented).
 export interface DraftJSBlock {
-  key: string;
   text: string;
   type: string;
-  depth: number;
-  inlineStyleRanges: any[];
-  entityRanges: { offset: number; length: number; key: number }[];
-  data?: Record<string, any>;
+  entity_ranges?: { offset: number; length: number; key: number }[];
 }
 
 export interface DraftJSContentState {
   blocks: DraftJSBlock[];
-  // Standard DraftJS raw shape (what convertToRaw emits). The X docs render the empty
-  // case as "entities": [] — if a live round trip shows X expects an array here instead
-  // of the keyed entityMap, that is the one field to change (see the smoke-test checklist).
-  entityMap: Record<string, { type: string; mutability: string; data: Record<string, any> }>;
+  entities: { key: string; value: { type: string; mutability: string; data: Record<string, any> } }[];
 }
 
 export interface ArticleResult {
   id: string;
   title: string;
   url?: string;
-}
-
-let _blockKeyCounter = 0;
-function nextBlockKey(): string {
-  return (++_blockKeyCounter).toString(36).padStart(5, "0");
 }
 
 /**
@@ -1012,12 +1030,12 @@ function nextBlockKey(): string {
  */
 export function buildArticleContentState(markdown: string): DraftJSContentState {
   const blocks: DraftJSBlock[] = [];
-  const entityMap: DraftJSContentState["entityMap"] = {};
+  const entities: DraftJSContentState["entities"] = [];
   let entityKey = 0;
 
   const pushBlock = (type: string, text: string) => {
-    // Extract inline [text](url) links → plain display text + DraftJS entity ranges.
-    const entityRanges: DraftJSBlock["entityRanges"] = [];
+    // Extract inline [text](url) links → plain display text + entity ranges.
+    const entityRanges: NonNullable<DraftJSBlock["entity_ranges"]> = [];
     const linkRe = /\[([^\]]+)\]\(([^)]+)\)/g;
     let out = "";
     let lastIndex = 0;
@@ -1026,13 +1044,13 @@ export function buildArticleContentState(markdown: string): DraftJSContentState 
       out += text.slice(lastIndex, m.index);
       const offset = out.length;
       out += m[1];
-      entityMap[String(entityKey)] = { type: "LINK", mutability: "MUTABLE", data: { url: m[2], href: m[2] } };
+      entities.push({ key: String(entityKey), value: { type: "link", mutability: "mutable", data: { url: m[2] } } });
       entityRanges.push({ offset, length: m[1].length, key: entityKey });
       entityKey++;
       lastIndex = linkRe.lastIndex;
     }
     out += text.slice(lastIndex);
-    blocks.push({ key: nextBlockKey(), text: out, type, depth: 0, inlineStyleRanges: [], entityRanges });
+    blocks.push({ text: out, type, ...(entityRanges.length > 0 ? { entity_ranges: entityRanges } : {}) });
   };
 
   let paragraphBuffer: string[] = [];
@@ -1067,11 +1085,11 @@ export function buildArticleContentState(markdown: string): DraftJSContentState 
   flushParagraph();
 
   if (blocks.length === 0) {
-    // DraftJS requires at least one block.
-    blocks.push({ key: nextBlockKey(), text: "", type: "unstyled", depth: 0, inlineStyleRanges: [], entityRanges: [] });
+    // At least one block is required.
+    blocks.push({ text: "", type: "unstyled" });
   }
 
-  return { blocks, entityMap };
+  return { blocks, entities };
 }
 
 /**
